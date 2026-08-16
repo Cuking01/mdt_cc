@@ -1,0 +1,3 @@
+[submodule "mindustry"]
+	path = mindustry
+	url = https://github.com/anuken/mindustry
