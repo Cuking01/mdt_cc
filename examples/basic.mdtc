@@ -1,0 +1,28 @@
+extern message message1;
+
+int clamp(int value, int minimum, int maximum) {
+    if (value < minimum) {
+        return minimum;
+    }
+    if (value > maximum) {
+        return maximum;
+    }
+    return value;
+}
+
+int iteration = 0;
+
+void main_loop() {
+    int total = 0;
+
+    for (int index = 0; index < 5; index++) {
+        total += clamp(index * 3, 0, 8);
+    }
+
+    iteration++;
+    print("iteration=");
+    print(iteration);
+    print(", total=");
+    print(total);
+    printflush(message1);
+}
