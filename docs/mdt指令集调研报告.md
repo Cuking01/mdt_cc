@@ -97,6 +97,8 @@
 
 `LogicOp` 当前包括：四则、整除、两种模、幂、宽松/严格比较、逻辑与、移位和位运算、`min/max`、角度、向量长度、噪声、绝对值、符号、对数、取整、平方根、随机数及三角函数。`ConditionOp` 包括 `equal`、`notEqual`、大小比较、`strictEqual` 和 `always`。
 
+当前语言将四则、整数余数、比较和逻辑与映射为常规运算符。游戏支持小数的普通余数另有 `mod`。其余 `LogicOp` 使用无 `op_` 前缀的内置函数：`idiv`、`mod`、`emod`、`pow`、`strict_equal`、`shl`、`shr`、`ushr`、`bit_or`、`bit_and`、`bit_xor`、`bit_not`、`max`、`min`、`angle`、`angle_diff`、`len`、`noise`、`abs`、`sign`、`log`、`logn`、`log10`、`floor`、`ceil`、`round`、`sqrt`、`rand` 以及全部三角函数。`angle`/`len` 额外接受 `vec`，`noise` 额外接受 `point` 或 `vec`。
+
 ### 4.2 链接、内存和通用感知
 
 | 指令 | 输入 | 输出 | 失败/权限语义 |

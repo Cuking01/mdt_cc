@@ -1,5 +1,3 @@
-extern message message1;
-
 int clamp(int value, int minimum, int maximum) {
     if (value < minimum) {
         return minimum;

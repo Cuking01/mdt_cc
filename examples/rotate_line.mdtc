@@ -1,0 +1,87 @@
+struct line_state {
+    number angle_0;
+    number angle_1;
+    number angle_2;
+    number angle_3;
+    number angle_4;
+    number phase_0;
+    number phase_1;
+    number phase_2;
+    number phase_3;
+    number phase_4;
+};
+
+number radius = 100;
+number angular_velocity = 90;
+number gradient_velocity = 120;
+number frame_seconds = 1.0/10;
+
+line_state initialize_state(number initial_angle,
+                            number initial_phase,
+                            number angle_speed,
+                            number color_speed,
+                            number delta_time) {
+    line_state result = {};
+    result.angle_0 = emod(initial_angle, 360);
+    result.angle_1 = emod(result.angle_0 - angle_speed * delta_time, 360);
+    result.angle_2 = emod(result.angle_1 - angle_speed * delta_time, 360);
+    result.angle_3 = emod(result.angle_2 - angle_speed * delta_time, 360);
+    result.angle_4 = emod(result.angle_3 - angle_speed * delta_time, 360);
+    result.phase_0 = emod(initial_phase, 360);
+    result.phase_1 = emod(result.phase_0 - color_speed * delta_time, 360);
+    result.phase_2 = emod(result.phase_1 - color_speed * delta_time, 360);
+    result.phase_3 = emod(result.phase_2 - color_speed * delta_time, 360);
+    result.phase_4 = emod(result.phase_3 - color_speed * delta_time, 360);
+    return result;
+}
+
+void draw_trail_line(number angle,
+                     number color_phase,
+                     number line_radius,
+                     int alpha) {
+    color line_color = rgba(round((sin(color_phase) + 1) * 127.5),
+                            round((sin(color_phase + 120) + 1) * 127.5),
+                            round((sin(color_phase + 240) + 1) * 127.5),
+                            alpha);
+    point center = {88, 88};
+    vec offset = vec{cos(angle), sin(angle)} * line_radius;
+    set_color(line_color);
+    draw_line(center - offset, center + offset);
+}
+
+line_state render_frame(line_state state,
+                        number line_radius,
+                        number angle_speed,
+                        number color_speed,
+                        number delta_time) {
+    draw_clear(color{0, 0, 0, 255});
+    set_stroke(2);
+    draw_trail_line(state.angle_4, state.phase_4, line_radius, 51);
+    draw_trail_line(state.angle_3, state.phase_3, line_radius, 102);
+    draw_trail_line(state.angle_2, state.phase_2, line_radius, 153);
+    draw_trail_line(state.angle_1, state.phase_1, line_radius, 204);
+    draw_trail_line(state.angle_0, state.phase_0, line_radius, 255);
+    drawflush(display1);
+
+    state.angle_4 = state.angle_3;
+    state.angle_3 = state.angle_2;
+    state.angle_2 = state.angle_1;
+    state.angle_1 = state.angle_0;
+    state.angle_0 = emod(state.angle_0 + angle_speed * delta_time, 360);
+    state.phase_4 = state.phase_3;
+    state.phase_3 = state.phase_2;
+    state.phase_2 = state.phase_1;
+    state.phase_1 = state.phase_0;
+    state.phase_0 = emod(state.phase_0 + color_speed * delta_time, 360);
+    return state;
+}
+
+line_state animation = initialize_state(0, 0, angular_velocity, gradient_velocity, frame_seconds);
+
+void main_loop() {
+    animation = render_frame(animation,
+                             radius,
+                             angular_velocity,
+                             gradient_velocity,
+                             frame_seconds);
+}

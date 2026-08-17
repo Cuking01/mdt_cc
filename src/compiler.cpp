@@ -43,10 +43,16 @@ enum class TokenKind {
     KwBool,
     KwInt,
     KwFloat,
+    KwDouble,
     KwNumber,
     KwString,
     KwMessage,
     KwBuilding,
+    KwDisplay,
+    KwColor,
+    KwPackedColor,
+    KwStruct,
+    KwSizeof,
     KwExtern,
     KwIf,
     KwElse,
@@ -85,6 +91,7 @@ enum class TokenKind {
     GreaterEqual,
     AndAnd,
     OrOr,
+    Dot,
 };
 
 struct Token {
@@ -172,9 +179,14 @@ private:
         static const std::unordered_map<std::string, TokenKind> keywords = {
             {"void", TokenKind::KwVoid}, {"bool", TokenKind::KwBool},
             {"int", TokenKind::KwInt}, {"float", TokenKind::KwFloat},
+            {"double", TokenKind::KwDouble},
             {"number", TokenKind::KwNumber}, {"string", TokenKind::KwString},
             {"message", TokenKind::KwMessage}, {"extern", TokenKind::KwExtern},
             {"building", TokenKind::KwBuilding},
+            {"display", TokenKind::KwDisplay},
+            {"color", TokenKind::KwColor},
+            {"packed_color", TokenKind::KwPackedColor},
+            {"struct", TokenKind::KwStruct}, {"sizeof", TokenKind::KwSizeof},
             {"if", TokenKind::KwIf}, {"else", TokenKind::KwElse},
             {"while", TokenKind::KwWhile}, {"for", TokenKind::KwFor},
             {"break", TokenKind::KwBreak}, {"continue", TokenKind::KwContinue},
@@ -279,6 +291,7 @@ private:
             case '|':
                 if (match('|')) return {TokenKind::OrOr, "||", start};
                 break;
+            case '.': return {TokenKind::Dot, ".", start};
         }
         throw CompileError(start.line, start.column,
                            std::string("无法识别的字符: ") + character);
@@ -290,10 +303,25 @@ private:
     std::size_t column_ = 1;
 };
 
-enum class TypeKind { Void, Bool, Int, Float, Number, String, Message, Building };
+enum class TypeKind { Void, Bool, Int, Float, Number, String, Message, Building, Display, PackedColor };
 
-std::string typeName(TypeKind type) {
-    switch (type) {
+struct Type {
+    TypeKind kind = TypeKind::Void;
+    std::string structName;
+
+    Type() = default;
+    Type(TypeKind kindValue) : kind(kindValue) {}
+    explicit Type(std::string name) : kind(TypeKind::Void), structName(std::move(name)) {}
+
+    [[nodiscard]] bool isStruct() const { return !structName.empty(); }
+    bool operator==(const Type&) const = default;
+    friend bool operator==(const Type& type, TypeKind kind) { return !type.isStruct() && type.kind == kind; }
+    friend bool operator==(TypeKind kind, const Type& type) { return type == kind; }
+};
+
+std::string typeName(const Type& type) {
+    if (type.isStruct()) return type.structName;
+    switch (type.kind) {
         case TypeKind::Void: return "void";
         case TypeKind::Bool: return "bool";
         case TypeKind::Int: return "int";
@@ -302,16 +330,102 @@ std::string typeName(TypeKind type) {
         case TypeKind::String: return "string";
         case TypeKind::Message: return "message";
         case TypeKind::Building: return "building";
+        case TypeKind::Display: return "display";
+        case TypeKind::PackedColor: return "packed_color";
     }
     return "<unknown>";
 }
 
-bool isNumeric(TypeKind type) {
+bool isNumeric(const Type& type) {
     return type == TypeKind::Int || type == TypeKind::Float || type == TypeKind::Number;
 }
 
+struct OpFunction {
+    std::string_view operation;
+    std::size_t arity;
+};
+
+std::optional<OpFunction> builtinOpFunction(std::string_view name) {
+    static const std::unordered_map<std::string_view, OpFunction> functions = {
+        {"idiv", {"idiv", 2}}, {"mod", {"mod", 2}}, {"emod", {"emod", 2}}, {"pow", {"pow", 2}},
+        {"strict_equal", {"strictEqual", 2}},
+        {"shl", {"shl", 2}}, {"shr", {"shr", 2}}, {"ushr", {"ushr", 2}},
+        {"bit_or", {"or", 2}}, {"bit_and", {"and", 2}}, {"bit_xor", {"xor", 2}},
+        {"bit_not", {"not", 1}},
+        {"max", {"max", 2}}, {"min", {"min", 2}},
+        {"angle", {"angle", 2}}, {"angle_diff", {"angleDiff", 2}},
+        {"len", {"len", 2}}, {"noise", {"noise", 2}},
+        {"abs", {"abs", 1}}, {"sign", {"sign", 1}},
+        {"log", {"log", 1}}, {"logn", {"logn", 2}}, {"log10", {"log10", 1}},
+        {"floor", {"floor", 1}}, {"ceil", {"ceil", 1}}, {"round", {"round", 1}},
+        {"sqrt", {"sqrt", 1}}, {"rand", {"rand", 1}},
+        {"sin", {"sin", 1}}, {"cos", {"cos", 1}}, {"tan", {"tan", 1}},
+        {"asin", {"asin", 1}}, {"acos", {"acos", 1}}, {"atan", {"atan", 1}},
+    };
+    const auto iterator = functions.find(name);
+    if (iterator == functions.end()) return std::nullopt;
+    return iterator->second;
+}
+
+std::optional<Type> implicitLinkType(std::string_view name) {
+    std::size_t suffix = name.size();
+    while (suffix > 0 && name[suffix - 1] >= '0' && name[suffix - 1] <= '9') --suffix;
+    if (suffix == 0 || suffix == name.size() || name[suffix] == '0') return std::nullopt;
+
+    static const std::unordered_set<std::string_view> prefixes = {
+        "accelerator", "acropolis", "afflict", "air", "arc", "assembler", "bank",
+        "basalt", "bastion", "battery", "beryllium", "blocks", "bluemat", "bore",
+        "boulder", "breach", "bridge", "bush", "canvas", "cell", "centrifuge",
+        "chamber", "char", "citadel", "cliff", "cluster", "compressor", "concentrator",
+        "condenser", "conduit", "constructor", "container", "conveyor", "crater",
+        "craters", "crucible", "crusher", "crux", "cryofluid", "cultivator", "cyclone",
+        "dacite", "damaged", "darksand", "dead", "deconstructor", "diffuse", "diode",
+        "dirt", "disassembler", "disperse", "display", "distributor", "dome", "door",
+        "drill", "driver", "duct", "duo", "electrolyzer", "empty", "extractor",
+        "fabricator", "factory", "floor", "foreshadow", "foundation", "furnace", "fuse",
+        "gate", "generator", "gigantic", "graphite", "grass", "hail", "heater",
+        "hotrock", "huge", "ice", "illuminator", "incinerator", "junction", "kiln",
+        "lancer", "link", "loader", "lustre", "magmarock", "malign", "meltdown",
+        "melter", "mender", "message", "metal", "mine", "missile", "mixer", "module",
+        "moss", "mud", "node", "nucleus", "orbs", "ore", "overlay", "pad", "panel",
+        "parallax", "pebbles", "phase", "pine", "plates", "point", "press", "processor",
+        "projector", "pulverizer", "pump", "radar", "reactor", "reconstructor",
+        "redirector", "redmat", "redweed", "refabricator", "regolith", "rhyolite",
+        "ripple", "router", "salt", "salvo", "scathe", "scatter", "scorch", "segment",
+        "separator", "shale", "shard", "shrubs", "slag", "smelter", "smite", "snow",
+        "sorter", "source", "space", "spawn", "spectre", "split", "stone", "sublimate",
+        "surge", "swarmer", "switch", "synthesizer", "tank", "tar", "tendrils",
+        "thorium", "thruster", "tiles", "titan", "tower", "tree", "tsunami", "tungsten",
+        "turret", "unloader", "vault", "vent", "void", "wall", "water", "wave",
+        "weaver", "white", "yellowcoral", "zone",
+    };
+
+    const std::string_view prefix = name.substr(0, suffix);
+    if (!prefixes.contains(prefix)) return std::nullopt;
+    if (prefix == "message") return TypeKind::Message;
+    if (prefix == "display") return TypeKind::Display;
+    return TypeKind::Building;
+}
+
+bool isBuiltinFunction(std::string_view name) {
+    return builtinOpFunction(name).has_value() ||
+           name == "print" || name == "printchar" || name == "putchar" ||
+           name == "format" || name == "printf" || name == "printflush" || name == "drawflush" ||
+           name == "wait" ||
+           name == "rgb" || name == "rgba" || name == "pack_color" || name == "unpack_color" ||
+           name == "draw_clear" || name == "draw_color" || name == "draw_col" || name == "set_color" ||
+           name == "set_packed_color" ||
+           name == "draw_stroke" || name == "set_stroke" ||
+           name == "draw_line" || name == "draw_rect" || name == "draw_line_rect" ||
+           name == "draw_poly" || name == "draw_line_poly" || name == "draw_triangle" ||
+           name == "draw_image" || name == "draw_print" || name == "draw_translate" ||
+           name == "draw_scale" || name == "draw_rotate" || name == "draw_reset" ||
+           name == "dot" || name == "cross" || name == "getlink";
+}
+
 struct Expr {
-    enum class Kind { Number, String, Boolean, Variable, Unary, Binary, Assign, Call, Prefix, Postfix };
+    enum class Kind { Number, String, Boolean, Variable, Unary, Binary, Assign, Call, Prefix, Postfix,
+                      Member, InitializerList, TypedInitializer, Sizeof };
 
     Kind kind = Kind::Number;
     SourceLocation location;
@@ -320,6 +434,7 @@ struct Expr {
     std::unique_ptr<Expr> left;
     std::unique_ptr<Expr> right;
     std::vector<std::unique_ptr<Expr>> arguments;
+    Type declaredType;
 };
 
 struct Stmt {
@@ -327,7 +442,7 @@ struct Stmt {
 
     Kind kind = Kind::Block;
     SourceLocation location;
-    TypeKind type = TypeKind::Void;
+    Type type;
     std::string name;
     std::vector<std::unique_ptr<Stmt>> statements;
     std::unique_ptr<Stmt> initializerStatement;
@@ -339,13 +454,13 @@ struct Stmt {
 };
 
 struct Parameter {
-    TypeKind type = TypeKind::Void;
+    Type type;
     std::string name;
     SourceLocation location;
 };
 
 struct FunctionDecl {
-    TypeKind returnType = TypeKind::Void;
+    Type returnType;
     std::string name;
     std::vector<Parameter> parameters;
     std::unique_ptr<Stmt> body;
@@ -353,27 +468,64 @@ struct FunctionDecl {
 };
 
 struct GlobalDecl {
-    TypeKind type = TypeKind::Void;
+    Type type;
     std::string name;
     bool external = false;
     std::unique_ptr<Expr> initializer;
     SourceLocation location;
 };
 
+struct StructField {
+    Type type;
+    std::string name;
+    SourceLocation location;
+};
+
+struct StructDecl {
+    std::string name;
+    std::vector<StructField> fields;
+    SourceLocation location;
+};
+
 struct Program {
+    std::vector<StructDecl> structs;
     std::vector<GlobalDecl> globals;
     std::vector<FunctionDecl> functions;
 };
 
+std::vector<StructDecl> builtinStructDeclarations() {
+    const SourceLocation location{1, 1};
+    StructDecl point{"point", {{TypeKind::Number, "x", location},
+                                {TypeKind::Number, "y", location}}, location};
+    StructDecl vector{"vec", {{TypeKind::Number, "x", location},
+                               {TypeKind::Number, "y", location}}, location};
+    StructDecl rectangle{"rect", {{Type("point"), "min", location},
+                                   {Type("point"), "max", location}}, location};
+    StructDecl color{"color", {{TypeKind::Int, "r", location},
+                                {TypeKind::Int, "g", location},
+                                {TypeKind::Int, "b", location},
+                                {TypeKind::Int, "a", location}}, location};
+    return {std::move(point), std::move(vector), std::move(rectangle), std::move(color)};
+}
+
 class Parser {
 public:
-    explicit Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
+    explicit Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {
+        structTypes_.insert("point");
+        structTypes_.insert("vec");
+        structTypes_.insert("rect");
+    }
 
     Program parse() {
         Program program;
+        program.structs = builtinStructDeclarations();
         while (!check(TokenKind::End)) {
+            if (match(TokenKind::KwStruct)) {
+                program.structs.push_back(parseStruct(previous()));
+                continue;
+            }
             const bool external = match(TokenKind::KwExtern);
-            const TypeKind type = parseType();
+            const Type type = parseType();
             const Token name = consume(TokenKind::Identifier, "类型后需要名称");
             if (match(TokenKind::LeftParen)) {
                 if (external) fail(name, "暂不支持 extern 函数");
@@ -389,6 +541,9 @@ private:
     const Token& current() const { return tokens_[position_]; }
     const Token& previous() const { return tokens_[position_ - 1]; }
     bool check(TokenKind kind) const { return current().kind == kind; }
+    bool checkNext(TokenKind kind) const {
+        return position_ + 1 < tokens_.size() && tokens_[position_ + 1].kind == kind;
+    }
 
     bool match(TokenKind kind) {
         if (!check(kind)) return false;
@@ -408,11 +563,19 @@ private:
     bool isTypeToken(TokenKind kind) const {
         return kind == TokenKind::KwVoid || kind == TokenKind::KwBool ||
                kind == TokenKind::KwInt || kind == TokenKind::KwFloat ||
+               kind == TokenKind::KwDouble ||
                kind == TokenKind::KwNumber || kind == TokenKind::KwString ||
-               kind == TokenKind::KwMessage || kind == TokenKind::KwBuilding;
+               kind == TokenKind::KwMessage || kind == TokenKind::KwBuilding ||
+               kind == TokenKind::KwDisplay || kind == TokenKind::KwColor ||
+               kind == TokenKind::KwPackedColor ||
+               (kind == TokenKind::Identifier && structTypes_.contains(current().text));
     }
 
-    TypeKind parseType() {
+    bool isTypedInitializerStart() const {
+        return isTypeToken(current().kind) && checkNext(TokenKind::LeftBrace);
+    }
+
+    Type parseType() {
         const Token token = current();
         ++position_;
         switch (token.kind) {
@@ -420,22 +583,50 @@ private:
             case TokenKind::KwBool: return TypeKind::Bool;
             case TokenKind::KwInt: return TypeKind::Int;
             case TokenKind::KwFloat: return TypeKind::Float;
+            case TokenKind::KwDouble: return TypeKind::Number;
             case TokenKind::KwNumber: return TypeKind::Number;
             case TokenKind::KwString: return TypeKind::String;
             case TokenKind::KwMessage: return TypeKind::Message;
             case TokenKind::KwBuilding: return TypeKind::Building;
+            case TokenKind::KwDisplay: return TypeKind::Display;
+            case TokenKind::KwColor: return Type("color");
+            case TokenKind::KwPackedColor: return TypeKind::PackedColor;
+            case TokenKind::Identifier:
+                if (structTypes_.contains(token.text)) return Type(token.text);
+                fail(token, "未知的数据类型: " + token.text);
             default: fail(token, "需要数据类型");
         }
     }
 
-    FunctionDecl parseFunction(TypeKind returnType, const Token& name) {
+    StructDecl parseStruct(const Token& keyword) {
+        const Token name = consume(TokenKind::Identifier, "struct 后需要类型名称");
+        if (!structTypes_.insert(name.text).second) fail(name, "重复的结构体名称: " + name.text);
+        StructDecl declaration;
+        declaration.name = name.text;
+        declaration.location = keyword.location;
+        consume(TokenKind::LeftBrace, "结构体定义需要左大括号");
+        std::unordered_set<std::string> fieldNames;
+        while (!check(TokenKind::RightBrace) && !check(TokenKind::End)) {
+            const Type fieldType = parseType();
+            const Token fieldName = consume(TokenKind::Identifier, "字段类型后需要名称");
+            if (fieldType == TypeKind::Void) fail(fieldName, "字段不能是 void 类型");
+            if (!fieldNames.insert(fieldName.text).second) fail(fieldName, "重复的字段名称: " + fieldName.text);
+            consume(TokenKind::Semicolon, "字段声明后需要分号");
+            declaration.fields.push_back({fieldType, fieldName.text, fieldName.location});
+        }
+        consume(TokenKind::RightBrace, "结构体定义缺少右大括号");
+        consume(TokenKind::Semicolon, "结构体定义后需要分号");
+        return declaration;
+    }
+
+    FunctionDecl parseFunction(Type returnType, const Token& name) {
         FunctionDecl function;
         function.returnType = returnType;
         function.name = name.text;
         function.location = name.location;
         if (!check(TokenKind::RightParen)) {
             do {
-                const TypeKind parameterType = parseType();
+                const Type parameterType = parseType();
                 if (parameterType == TypeKind::Void) fail(previous(), "参数不能是 void 类型");
                 const Token parameterName = consume(TokenKind::Identifier, "参数类型后需要名称");
                 function.parameters.push_back({parameterType, parameterName.text, parameterName.location});
@@ -446,7 +637,7 @@ private:
         return function;
     }
 
-    GlobalDecl parseGlobal(TypeKind type, const Token& name, bool external) {
+    GlobalDecl parseGlobal(Type type, const Token& name, bool external) {
         if (type == TypeKind::Void) fail(name, "变量不能是 void 类型");
         GlobalDecl global;
         global.type = type;
@@ -454,6 +645,7 @@ private:
         global.external = external;
         global.location = name.location;
         if (match(TokenKind::Equal)) global.initializer = parseExpression();
+        else if (check(TokenKind::LeftBrace)) global.initializer = parseInitializerList();
         if (external && global.initializer) fail(name, "extern 变量不能带初始化器");
         consume(TokenKind::Semicolon, "全局变量声明后需要分号");
         return global;
@@ -485,7 +677,7 @@ private:
         if (match(TokenKind::KwBreak)) return parseSimple(Stmt::Kind::Break, previous());
         if (match(TokenKind::KwContinue)) return parseSimple(Stmt::Kind::Continue, previous());
         if (match(TokenKind::KwReturn)) return parseReturn(previous());
-        if (isTypeToken(current().kind)) return parseVariable(true);
+        if (isTypeToken(current().kind) && !isTypedInitializerStart()) return parseVariable(true);
 
         auto statement = std::make_unique<Stmt>();
         statement->kind = Stmt::Kind::Expression;
@@ -496,7 +688,7 @@ private:
     }
 
     std::unique_ptr<Stmt> parseVariable(bool consumeSemicolon) {
-        const TypeKind type = parseType();
+        const Type type = parseType();
         const Token name = consume(TokenKind::Identifier, "变量类型后需要名称");
         if (type == TypeKind::Void) fail(name, "变量不能是 void 类型");
         auto statement = std::make_unique<Stmt>();
@@ -505,6 +697,7 @@ private:
         statement->type = type;
         statement->name = name.text;
         if (match(TokenKind::Equal)) statement->expression = parseExpression();
+        else if (check(TokenKind::LeftBrace)) statement->expression = parseInitializerList();
         if (consumeSemicolon) consume(TokenKind::Semicolon, "变量声明后需要分号");
         return statement;
     }
@@ -538,7 +731,7 @@ private:
         statement->location = keyword.location;
         consume(TokenKind::LeftParen, "for 后需要左括号");
         if (match(TokenKind::Semicolon)) {
-        } else if (isTypeToken(current().kind)) {
+        } else if (isTypeToken(current().kind) && !isTypedInitializerStart()) {
             statement->initializerStatement = parseVariable(false);
             consume(TokenKind::Semicolon, "for 初始化部分后需要分号");
         } else {
@@ -655,6 +848,17 @@ private:
     }
 
     std::unique_ptr<Expr> parseUnary() {
+        if (match(TokenKind::KwSizeof)) {
+            const Token keyword = previous();
+            consume(TokenKind::LeftParen, "sizeof 后需要左括号");
+            auto expression = std::make_unique<Expr>();
+            expression->kind = Expr::Kind::Sizeof;
+            expression->location = keyword.location;
+            if (isTypeToken(current().kind) && !isTypedInitializerStart()) expression->declaredType = parseType();
+            else expression->left = parseExpression();
+            consume(TokenKind::RightParen, "sizeof 参数后需要右括号");
+            return expression;
+        }
         if (match(TokenKind::Bang) || match(TokenKind::Minus) || match(TokenKind::Plus) ||
             match(TokenKind::PlusPlus) || match(TokenKind::MinusMinus)) {
             const Token operation = previous();
@@ -693,6 +897,14 @@ private:
                 postfix->text = operation.text;
                 postfix->left = std::move(expression);
                 expression = std::move(postfix);
+            } else if (match(TokenKind::Dot)) {
+                const Token memberName = consume(TokenKind::Identifier, "点号后需要字段名称");
+                auto member = std::make_unique<Expr>();
+                member->kind = Expr::Kind::Member;
+                member->location = memberName.location;
+                member->text = memberName.text;
+                member->left = std::move(expression);
+                expression = std::move(member);
             } else {
                 break;
             }
@@ -702,6 +914,15 @@ private:
 
     std::unique_ptr<Expr> parsePrimary() {
         const Token token = current();
+        if (isTypedInitializerStart()) {
+            const Type type = parseType();
+            if (type == TypeKind::Void) fail(token, "不能构造 void 值");
+            auto expression = parseInitializerList();
+            expression->kind = Expr::Kind::TypedInitializer;
+            expression->location = token.location;
+            expression->declaredType = type;
+            return expression;
+        }
         if (match(TokenKind::NumberLiteral)) {
             auto expression = std::make_unique<Expr>();
             expression->kind = Expr::Kind::Number;
@@ -735,7 +956,22 @@ private:
             consume(TokenKind::RightParen, "表达式缺少右括号");
             return expression;
         }
+        if (check(TokenKind::LeftBrace)) return parseInitializerList();
         fail(token, "需要表达式");
+    }
+
+    std::unique_ptr<Expr> parseInitializerList() {
+        const Token brace = consume(TokenKind::LeftBrace, "初始化列表需要左大括号");
+        auto expression = std::make_unique<Expr>();
+        expression->kind = Expr::Kind::InitializerList;
+        expression->location = brace.location;
+        if (!check(TokenKind::RightBrace)) {
+            do {
+                expression->arguments.push_back(parseExpression());
+            } while (match(TokenKind::Comma) && !check(TokenKind::RightBrace));
+        }
+        consume(TokenKind::RightBrace, "初始化列表缺少右大括号");
+        return expression;
     }
 
     static std::unique_ptr<Expr> makeBinary(std::unique_ptr<Expr> left,
@@ -752,6 +988,7 @@ private:
 
     std::vector<Token> tokens_;
     std::size_t position_ = 0;
+    std::unordered_set<std::string> structTypes_;
 };
 
 struct Instruction {
@@ -804,29 +1041,38 @@ private:
 };
 
 struct Symbol {
-    TypeKind type = TypeKind::Void;
+    Type type;
     std::string storage;
     bool assignable = true;
+    std::vector<std::string> components;
 };
 
 struct FunctionInfo {
     const FunctionDecl* declaration = nullptr;
     std::string entryLabel;
     std::string returnAddress;
-    std::string resultStorage;
-    std::vector<std::string> parameterStorage;
+    std::vector<std::string> resultStorage;
+    std::vector<std::vector<std::string>> parameterStorage;
 };
 
 struct ExpressionResult {
-    TypeKind type = TypeKind::Void;
+    Type type;
     std::string operand;
     bool lvalue = false;
+    std::vector<std::string> components;
+
+    ExpressionResult() = default;
+    ExpressionResult(Type typeValue, std::string operandValue, bool lvalueValue,
+                     std::vector<std::string> componentValues = {})
+        : type(std::move(typeValue)), operand(std::move(operandValue)), lvalue(lvalueValue),
+          components(std::move(componentValues)) {}
 };
 
 class Generator {
 public:
     Generator(const Program& program, CompileOptions options)
         : program_(program), options_(options) {
+        collectStructDeclarations();
         collectDeclarations();
         validateCallGraph();
     }
@@ -881,29 +1127,94 @@ private:
         return result;
     }
 
-    static std::string defaultValue(TypeKind type) {
-        switch (type) {
+    static std::string defaultValue(const Type& type) {
+        switch (type.kind) {
             case TypeKind::Bool:
             case TypeKind::Int:
             case TypeKind::Float:
             case TypeKind::Number: return "0";
             case TypeKind::String: return "\"\"";
             case TypeKind::Message:
-            case TypeKind::Building: return "null";
+            case TypeKind::Building:
+            case TypeKind::Display: return "null";
+            case TypeKind::PackedColor: return "0";
             case TypeKind::Void: break;
         }
         return "null";
     }
 
+    void collectStructDeclarations() {
+        for (const StructDecl& declaration : program_.structs) {
+            if (!structs_.emplace(declaration.name, &declaration).second) {
+                fail(declaration.location, "重复的结构体名称: " + declaration.name);
+            }
+        }
+
+        enum class State { Visiting, Complete };
+        std::unordered_map<std::string, State> states;
+        std::function<void(const Type&, SourceLocation)> validate = [&](const Type& type, SourceLocation location) {
+            if (!type.isStruct()) return;
+            const auto declaration = structs_.find(type.structName);
+            if (declaration == structs_.end()) fail(location, "未知的结构体类型: " + type.structName);
+            const auto state = states.find(type.structName);
+            if (state != states.end()) {
+                if (state->second == State::Visiting) fail(location, "结构体不能直接或间接包含自身: " + type.structName);
+                return;
+            }
+            states[type.structName] = State::Visiting;
+            for (const StructField& field : declaration->second->fields) validate(field.type, field.location);
+            states[type.structName] = State::Complete;
+        };
+        for (const StructDecl& declaration : program_.structs) validate(Type(declaration.name), declaration.location);
+    }
+
+    [[nodiscard]] std::size_t typeSize(const Type& type) const {
+        if (!type.isStruct()) return type == TypeKind::Void ? 0 : 1;
+        std::size_t size = 0;
+        for (const StructField& field : structs_.at(type.structName)->fields) size += typeSize(field.type);
+        return size;
+    }
+
+    void appendStorage(const Type& type, const std::string& base, std::vector<std::string>& result) const {
+        if (!type.isStruct()) {
+            result.push_back(base);
+            return;
+        }
+        for (const StructField& field : structs_.at(type.structName)->fields) {
+            appendStorage(field.type, base + '_' + field.name, result);
+        }
+    }
+
+    [[nodiscard]] std::vector<std::string> storageFor(const Type& type, const std::string& base) const {
+        std::vector<std::string> result;
+        appendStorage(type, base, result);
+        return result;
+    }
+
+    [[nodiscard]] std::vector<std::string> operandsOf(const ExpressionResult& value) const {
+        return value.type.isStruct() ? value.components : std::vector<std::string>{value.operand};
+    }
+
+    [[nodiscard]] std::vector<std::string> operandsOf(const Symbol& symbol) const {
+        return symbol.type.isStruct() ? symbol.components : std::vector<std::string>{symbol.storage};
+    }
+
     void collectDeclarations() {
         std::unordered_set<std::string> topLevelNames;
+        for (const StructDecl& declaration : program_.structs) topLevelNames.insert(declaration.name);
         for (const GlobalDecl& global : program_.globals) {
+            if (implicitLinkType(global.name)) {
+                fail(global.location, "Mindustry 链接标识符不能被声明: " + global.name);
+            }
             if (!topLevelNames.insert(global.name).second) fail(global.location, "重复的全局名称: " + global.name);
         }
 
         for (const FunctionDecl& function : program_.functions) {
+            if (implicitLinkType(function.name)) {
+                fail(function.location, "Mindustry 链接标识符不能被声明: " + function.name);
+            }
             if (!topLevelNames.insert(function.name).second) fail(function.location, "重复的顶层名称: " + function.name);
-            if (function.name == "print" || function.name == "printflush" || function.name == "getlink") {
+            if (isBuiltinFunction(function.name)) {
                 fail(function.location, "不能重新定义内置函数 " + function.name);
             }
 
@@ -912,15 +1223,19 @@ private:
             info.entryLabel = "__function_" + function.name;
             info.returnAddress = "__function_" + function.name + "_return_address";
             if (function.returnType != TypeKind::Void) {
-                info.resultStorage = "__function_" + function.name + "_result";
+                info.resultStorage = storageFor(function.returnType, "__function_" + function.name + "_result");
             }
             std::unordered_set<std::string> parameterNames;
             for (std::size_t index = 0; index < function.parameters.size(); ++index) {
                 const Parameter& parameter = function.parameters[index];
+                if (implicitLinkType(parameter.name)) {
+                    fail(parameter.location, "Mindustry 链接标识符不能被声明: " + parameter.name);
+                }
                 if (!parameterNames.insert(parameter.name).second) {
                     fail(parameter.location, "重复的参数名称: " + parameter.name);
                 }
-                info.parameterStorage.push_back("__function_" + function.name + "_arg" + std::to_string(index));
+                info.parameterStorage.push_back(storageFor(parameter.type,
+                    "__function_" + function.name + "_arg" + std::to_string(index)));
             }
             functions_.emplace(function.name, std::move(info));
         }
@@ -935,6 +1250,7 @@ private:
 
     static void collectCalls(const Expr* expression, std::vector<std::pair<std::string, SourceLocation>>& calls) {
         if (expression == nullptr) return;
+        if (expression->kind == Expr::Kind::Sizeof) return;
         if (expression->kind == Expr::Kind::Call) calls.emplace_back(expression->text, expression->location);
         collectCalls(expression->left.get(), calls);
         collectCalls(expression->right.get(), calls);
@@ -958,7 +1274,7 @@ private:
             std::vector<std::pair<std::string, SourceLocation>> calls;
             collectCalls(function.body.get(), calls);
             for (const auto& [callee, location] : calls) {
-                if (callee == "print" || callee == "printflush" || callee == "getlink") continue;
+                if (isBuiltinFunction(callee)) continue;
                 if (functions_.find(callee) == functions_.end()) fail(location, "未定义的函数: " + callee);
                 if (callee == "main_loop") fail(location, "不能显式调用 main_loop");
                 graph[function.name].push_back(callee);
@@ -995,7 +1311,8 @@ private:
     void declareGlobals() {
         for (const GlobalDecl& global : program_.globals) {
             const std::string storage = global.external ? global.name : "__global_" + global.name;
-            scopes_.front().emplace(global.name, Symbol{global.type, storage, !global.external});
+            if (global.external && global.type.isStruct()) fail(global.location, "extern 结构体变量暂不支持");
+            scopes_.front().emplace(global.name, makeSymbol(global.type, storage, !global.external));
         }
     }
 
@@ -1003,11 +1320,10 @@ private:
         if (global.external) return;
         const Symbol& symbol = scopes_.front().at(global.name);
         if (global.initializer) {
-            const ExpressionResult value = generateExpression(*global.initializer);
-            requireAssignable(global.type, value.type, global.location);
-            emitter_.emit("set", {symbol.storage, value.operand});
+            const ExpressionResult value = generateValue(*global.initializer, global.type);
+            assignValue(symbol, value);
         } else {
-            emitter_.emit("set", {symbol.storage, defaultValue(global.type)});
+            assignValue(symbol, defaultResult(global.type));
         }
     }
 
@@ -1023,7 +1339,9 @@ private:
         pushScope();
         for (std::size_t index = 0; index < function.parameters.size(); ++index) {
             declareLocal(function.parameters[index].name,
-                         {function.parameters[index].type, info.parameterStorage[index], true},
+                         function.parameters[index].type.isStruct()
+                            ? Symbol{function.parameters[index].type, "", true, info.parameterStorage[index]}
+                            : Symbol{function.parameters[index].type, info.parameterStorage[index].front(), true, {}},
                          function.parameters[index].location);
         }
         generateStatement(*function.body);
@@ -1061,30 +1379,108 @@ private:
     void popScope() { scopes_.pop_back(); }
 
     void declareLocal(const std::string& name, Symbol symbol, SourceLocation location) {
+        if (implicitLinkType(name)) {
+            fail(location, "Mindustry 链接标识符不能被声明: " + name);
+        }
         if (!scopes_.back().emplace(name, std::move(symbol)).second) {
             fail(location, "同一作用域内重复定义变量: " + name);
         }
     }
 
-    const Symbol& resolve(const std::string& name, SourceLocation location) const {
+    Symbol resolve(const std::string& name, SourceLocation location) const {
         for (auto iterator = scopes_.rbegin(); iterator != scopes_.rend(); ++iterator) {
             const auto symbol = iterator->find(name);
             if (symbol != iterator->end()) return symbol->second;
         }
+        if (const std::optional<Type> type = implicitLinkType(name)) {
+            return {*type, name, false, {}};
+        }
         fail(location, "未定义的变量: " + name);
     }
 
-    static bool canAssign(TypeKind destination, TypeKind source) {
+    static bool canAssign(const Type& destination, const Type& source) {
         if (destination == source) return true;
         if (destination == TypeKind::Number && isNumeric(source)) return true;
         if (destination == TypeKind::Float && (source == TypeKind::Int || source == TypeKind::Number)) return true;
         return false;
     }
 
-    static void requireAssignable(TypeKind destination, TypeKind source, SourceLocation location) {
+    static void requireAssignable(const Type& destination, const Type& source, SourceLocation location) {
         if (!canAssign(destination, source)) {
             fail(location, "不能把 " + typeName(source) + " 赋值给 " + typeName(destination));
         }
+    }
+
+    [[nodiscard]] Symbol makeSymbol(const Type& type, const std::string& base, bool assignable) const {
+        if (type.isStruct()) return {type, "", assignable, storageFor(type, base)};
+        return {type, base, assignable, {}};
+    }
+
+    [[nodiscard]] ExpressionResult fromSymbol(const Symbol& symbol) const {
+        return {symbol.type, symbol.storage, symbol.assignable, symbol.components};
+    }
+
+    [[nodiscard]] ExpressionResult defaultResult(const Type& type) const {
+        if (!type.isStruct()) return {type, defaultValue(type), false, {}};
+        std::vector<std::string> components;
+        for (const StructField& field : structs_.at(type.structName)->fields) {
+            const ExpressionResult fieldDefault = defaultResult(field.type);
+            const std::vector<std::string> fieldOperands = operandsOf(fieldDefault);
+            components.insert(components.end(), fieldOperands.begin(), fieldOperands.end());
+        }
+        return {type, "", false, std::move(components)};
+    }
+
+    [[nodiscard]] ExpressionResult materialize(const ExpressionResult& value) {
+        const std::vector<std::string> source = operandsOf(value);
+        std::vector<std::string> saved;
+        saved.reserve(source.size());
+        for (const std::string& operand : source) {
+            const std::string temporaryStorage = temporary();
+            emitter_.emit("set", {temporaryStorage, operand});
+            saved.push_back(temporaryStorage);
+        }
+        if (value.type.isStruct()) return {value.type, "", false, std::move(saved)};
+        return {value.type, saved.front(), false, {}};
+    }
+
+    void assignValue(const Symbol& destination, const ExpressionResult& source) {
+        const std::vector<std::string> destinations = operandsOf(destination);
+        const std::vector<std::string> sources = operandsOf(source);
+        if (destinations.size() != sources.size()) throw std::logic_error("聚合赋值字段数量不一致");
+        for (std::size_t index = 0; index < destinations.size(); ++index) {
+            emitter_.emit("set", {destinations[index], sources[index]});
+        }
+    }
+
+    ExpressionResult generateValue(const Expr& expression, const Type& expected) {
+        if (expression.kind == Expr::Kind::InitializerList) return generateInitializer(expression, expected);
+        ExpressionResult value = generateExpression(expression);
+        requireAssignable(expected, value.type, expression.location);
+        return value;
+    }
+
+    ExpressionResult generateInitializer(const Expr& expression, const Type& expected) {
+        if (!expected.isStruct()) {
+            if (expression.arguments.size() > 1) fail(expression.location, "标量初始化列表最多包含一个元素");
+            if (expression.arguments.empty()) return defaultResult(expected);
+            return materialize(generateValue(*expression.arguments.front(), expected));
+        }
+
+        const StructDecl& declaration = *structs_.at(expected.structName);
+        if (expression.arguments.size() > declaration.fields.size()) {
+            fail(expression.location, "结构体 " + expected.structName + " 的初始化项过多");
+        }
+        std::vector<std::string> components;
+        for (std::size_t index = 0; index < declaration.fields.size(); ++index) {
+            ExpressionResult fieldValue = index < expression.arguments.size()
+                ? generateValue(*expression.arguments[index], declaration.fields[index].type)
+                : defaultResult(declaration.fields[index].type);
+            fieldValue = materialize(fieldValue);
+            const std::vector<std::string> fieldOperands = operandsOf(fieldValue);
+            components.insert(components.end(), fieldOperands.begin(), fieldOperands.end());
+        }
+        return {expected, "", false, std::move(components)};
     }
 
     ExpressionResult toBoolean(ExpressionResult value, SourceLocation location) {
@@ -1107,13 +1503,13 @@ private:
             }
             case Stmt::Kind::Variable: {
                 const std::string storage = uniqueStorage(statement.name);
-                declareLocal(statement.name, {statement.type, storage, true}, statement.location);
+                declareLocal(statement.name, makeSymbol(statement.type, storage, true), statement.location);
+                const Symbol symbol = resolve(statement.name, statement.location);
                 if (statement.expression) {
-                    const ExpressionResult value = generateExpression(*statement.expression);
-                    requireAssignable(statement.type, value.type, statement.location);
-                    emitter_.emit("set", {storage, value.operand});
+                    const ExpressionResult value = generateValue(*statement.expression, statement.type);
+                    assignValue(symbol, value);
                 } else {
-                    emitter_.emit("set", {storage, defaultValue(statement.type)});
+                    assignValue(symbol, defaultResult(statement.type));
                 }
                 break;
             }
@@ -1210,9 +1606,11 @@ private:
             if (statement.expression) fail(statement.location, "void 函数不能返回值");
         } else {
             if (!statement.expression) fail(statement.location, "非 void 函数必须返回值");
-            const ExpressionResult value = generateExpression(*statement.expression);
-            requireAssignable(currentFunction_->returnType, value.type, statement.location);
-            emitter_.emit("set", {info.resultStorage, value.operand});
+            const ExpressionResult value = materialize(generateValue(*statement.expression, currentFunction_->returnType));
+            const Symbol result = currentFunction_->returnType.isStruct()
+                ? Symbol{currentFunction_->returnType, "", true, info.resultStorage}
+                : Symbol{currentFunction_->returnType, info.resultStorage.front(), true, {}};
+            assignValue(result, value);
         }
         emitFunctionReturn();
     }
@@ -1233,8 +1631,8 @@ private:
             case Expr::Kind::Boolean:
                 return {TypeKind::Bool, expression.boolean ? "true" : "false", false};
             case Expr::Kind::Variable: {
-                const Symbol& symbol = resolve(expression.text, expression.location);
-                return {symbol.type, symbol.storage, symbol.assignable};
+                const Symbol symbol = resolve(expression.text, expression.location);
+                return fromSymbol(symbol);
             }
             case Expr::Kind::Unary:
                 return generateUnary(expression);
@@ -1248,12 +1646,303 @@ private:
                 return generateIncrement(expression, true);
             case Expr::Kind::Postfix:
                 return generateIncrement(expression, false);
+            case Expr::Kind::Member:
+                return generateMember(expression);
+            case Expr::Kind::InitializerList:
+                fail(expression.location, "初始化列表需要明确的目标类型");
+            case Expr::Kind::TypedInitializer:
+                return generateInitializer(expression, expression.declaredType);
+            case Expr::Kind::Sizeof:
+                {
+                    const Type sizedType = expression.left ? expressionType(*expression.left) : expression.declaredType;
+                    if (sizedType == TypeKind::Void) fail(expression.location, "不能对 void 使用 sizeof");
+                    return {TypeKind::Int, std::to_string(typeSize(sizedType)), false};
+                }
         }
         fail(expression.location, "未知表达式");
     }
 
+    void validateInitializerType(const Expr& expression, const Type& expected) const {
+        if (expression.kind != Expr::Kind::InitializerList &&
+            expression.kind != Expr::Kind::TypedInitializer) {
+            requireAssignable(expected, expressionType(expression), expression.location);
+            return;
+        }
+        if (!expected.isStruct()) {
+            if (expression.arguments.size() > 1) fail(expression.location, "标量初始化列表最多包含一个元素");
+            if (!expression.arguments.empty()) validateInitializerType(*expression.arguments.front(), expected);
+            return;
+        }
+        const StructDecl& declaration = *structs_.at(expected.structName);
+        if (expression.arguments.size() > declaration.fields.size()) {
+            fail(expression.location, "结构体 " + expected.structName + " 的初始化项过多");
+        }
+        for (std::size_t index = 0; index < expression.arguments.size(); ++index) {
+            validateInitializerType(*expression.arguments[index], declaration.fields[index].type);
+        }
+    }
+
+    Type builtinOpType(const Expr& expression) const {
+        const std::optional<OpFunction> function = builtinOpFunction(expression.text);
+        if (!function) fail(expression.location, "未知的 op 函数: " + expression.text);
+
+        const bool coordinateOverload = expression.arguments.size() == 1 &&
+            (expression.text == "angle" || expression.text == "len" || expression.text == "noise");
+        if (coordinateOverload) {
+            const Type argument = expressionType(*expression.arguments[0]);
+            const bool valid = argument == Type("vec") ||
+                               (expression.text == "noise" && argument == Type("point"));
+            if (!valid) fail(expression.location, expression.text + " 单参数形式需要 vec" +
+                                                  (expression.text == "noise" ? " 或 point" : ""));
+            return TypeKind::Number;
+        }
+        if (expression.arguments.size() != function->arity) {
+            fail(expression.location, expression.text + " 需要 " + std::to_string(function->arity) + " 个参数");
+        }
+
+        std::vector<Type> argumentTypes;
+        argumentTypes.reserve(expression.arguments.size());
+        for (const auto& argument : expression.arguments) argumentTypes.push_back(expressionType(*argument));
+
+        if (expression.text == "strict_equal") {
+            const Type& left = argumentTypes[0];
+            const Type& right = argumentTypes[1];
+            if (left.isStruct() || right.isStruct() ||
+                (left != right && !(isNumeric(left) && isNumeric(right)))) {
+                fail(expression.location, "strict_equal 参数类型不兼容");
+            }
+            return TypeKind::Bool;
+        }
+
+        const bool bitwise = expression.text == "shl" || expression.text == "shr" ||
+                             expression.text == "ushr" || expression.text == "bit_or" ||
+                             expression.text == "bit_and" || expression.text == "bit_xor" ||
+                             expression.text == "bit_not";
+        for (const Type& type : argumentTypes) {
+            if (bitwise ? type != TypeKind::Int : !isNumeric(type)) {
+                fail(expression.location, expression.text + (bitwise ? " 参数必须是 int" : " 参数必须是数值类型"));
+            }
+        }
+        if (bitwise || expression.text == "idiv" || expression.text == "floor" ||
+            expression.text == "ceil" || expression.text == "round") {
+            return TypeKind::Int;
+        }
+        if (expression.text == "mod" || expression.text == "emod" ||
+            expression.text == "max" || expression.text == "min") {
+            return commonNumericType(argumentTypes[0], argumentTypes[1], expression.text);
+        }
+        if (expression.text == "abs") return argumentTypes[0];
+        return TypeKind::Number;
+    }
+
+    Type expressionType(const Expr& expression) const {
+        switch (expression.kind) {
+            case Expr::Kind::Number:
+                return expression.text.find_first_of(".eE") == std::string::npos ? TypeKind::Int : TypeKind::Number;
+            case Expr::Kind::String: return TypeKind::String;
+            case Expr::Kind::Boolean: return TypeKind::Bool;
+            case Expr::Kind::Variable: return resolve(expression.text, expression.location).type;
+            case Expr::Kind::Unary: {
+                const Type operand = expressionType(*expression.right);
+                if (operand == Type("vec") && (expression.text == "+" || expression.text == "-")) return operand;
+                if (expression.text == "!") {
+                    if (operand != TypeKind::Bool && !isNumeric(operand)) fail(expression.location, "条件需要 bool 或数值类型");
+                    return TypeKind::Bool;
+                }
+                if (!isNumeric(operand)) fail(expression.location, "一元运算符需要数值操作数");
+                return operand;
+            }
+            case Expr::Kind::Binary: {
+                const Type left = expressionType(*expression.left);
+                const Type right = expressionType(*expression.right);
+                if (left.isStruct() || right.isStruct()) {
+                    const Type point("point"), vector("vec");
+                    if (expression.text == "+") {
+                        if (left == vector && right == vector) return vector;
+                        if ((left == point && right == vector) || (left == vector && right == point)) return point;
+                    } else if (expression.text == "-") {
+                        if (left == vector && right == vector) return vector;
+                        if (left == point && right == vector) return point;
+                        if (left == point && right == point) return vector;
+                    } else if (expression.text == "*" &&
+                               ((left == vector && isNumeric(right)) ||
+                                (isNumeric(left) && right == vector))) {
+                        return vector;
+                    }
+                    fail(expression.location, "该运算符不支持这些聚合类型");
+                }
+                if (expression.text == "&&" || expression.text == "||") {
+                    if ((left != TypeKind::Bool && !isNumeric(left)) || (right != TypeKind::Bool && !isNumeric(right))) {
+                        fail(expression.location, "逻辑运算需要 bool 或数值类型");
+                    }
+                    return TypeKind::Bool;
+                }
+                if (expression.text == "==" || expression.text == "!=") {
+                    if (left.isStruct() || right.isStruct()) fail(expression.location, "结构体暂不支持比较运算");
+                    if (left != right && !(isNumeric(left) && isNumeric(right))) {
+                        fail(expression.location, "不能比较 " + typeName(left) + " 和 " + typeName(right));
+                    }
+                    return TypeKind::Bool;
+                }
+                if (expression.text == "<" || expression.text == "<=" || expression.text == ">" || expression.text == ">=") {
+                    if (!isNumeric(left) || !isNumeric(right)) fail(expression.location, "顺序比较需要数值操作数");
+                    return TypeKind::Bool;
+                }
+                if (!isNumeric(left) || !isNumeric(right)) fail(expression.location, "算术运算需要数值操作数");
+                if (expression.text == "%" && (left != TypeKind::Int || right != TypeKind::Int)) {
+                    fail(expression.location, "% 只接受 int 操作数");
+                }
+                return commonNumericType(left, right, expression.text);
+            }
+            case Expr::Kind::Assign: {
+                const Type destination = expressionType(*expression.left);
+                if (expression.right->kind != Expr::Kind::InitializerList) {
+                    const Type source = expressionType(*expression.right);
+                    if (expression.text == "=" ) {
+                        requireAssignable(destination, source, expression.location);
+                    } else if (destination.isStruct()) {
+                        const Type point("point"), vector("vec");
+                        const bool valid = ((expression.text == "+=" || expression.text == "-=") &&
+                                            ((destination == vector && source == vector) ||
+                                             (destination == point && source == vector))) ||
+                                           (expression.text == "*=" && destination == vector && isNumeric(source));
+                        if (!valid) fail(expression.location, "该复合赋值不支持这些聚合类型");
+                    } else if (!isNumeric(destination) || !isNumeric(source)) {
+                        fail(expression.location, "复合赋值需要数值操作数");
+                    }
+                }
+                return destination;
+            }
+            case Expr::Kind::Prefix: {
+                const Type type = expressionType(*expression.right);
+                if (!isNumeric(type)) fail(expression.location, "++/-- 需要数值变量");
+                return type;
+            }
+            case Expr::Kind::Postfix: {
+                const Type type = expressionType(*expression.left);
+                if (!isNumeric(type)) fail(expression.location, "++/-- 需要数值变量");
+                return type;
+            }
+            case Expr::Kind::Member: {
+                const Type objectType = expressionType(*expression.left);
+                if (!objectType.isStruct()) fail(expression.location, "点号左侧必须是结构体");
+                for (const StructField& field : structs_.at(objectType.structName)->fields) {
+                    if (field.name == expression.text) return field.type;
+                }
+                fail(expression.location, "结构体 " + objectType.structName + " 没有字段 " + expression.text);
+            }
+            case Expr::Kind::Call: {
+                if (builtinOpFunction(expression.text)) return builtinOpType(expression);
+                if (expression.text == "rgb" || expression.text == "rgba") {
+                    const std::size_t expected = expression.text == "rgb" ? 3 : 4;
+                    if (expression.arguments.size() != expected) {
+                        fail(expression.location, expression.text + " 需要 " + std::to_string(expected) + " 个参数");
+                    }
+                    for (const auto& argument : expression.arguments) {
+                        if (expressionType(*argument) != TypeKind::Int) {
+                            fail(argument->location, expression.text + " 参数必须是 int");
+                        }
+                    }
+                    return Type("color");
+                }
+                if (expression.text == "pack_color") {
+                    if (expression.arguments.size() == 1) {
+                        if (expressionType(*expression.arguments[0]) != Type("color")) {
+                            fail(expression.location, "pack_color 单参数形式需要 color");
+                        }
+                    } else if (expression.arguments.size() == 3 || expression.arguments.size() == 4) {
+                        for (const auto& argument : expression.arguments) {
+                            if (expressionType(*argument) != TypeKind::Int) {
+                                fail(argument->location, "pack_color 标量参数必须是 int");
+                            }
+                        }
+                    } else {
+                        fail(expression.location, "pack_color 需要一个 color、三个 int 或四个 int 参数");
+                    }
+                    return TypeKind::PackedColor;
+                }
+                if (expression.text == "unpack_color") {
+                    if (expression.arguments.size() != 1 || expressionType(*expression.arguments[0]) != TypeKind::PackedColor) {
+                        fail(expression.location, "unpack_color 需要一个 packed_color 参数");
+                    }
+                    return Type("color");
+                }
+                if (expression.text == "dot" || expression.text == "cross") {
+                    if (expression.arguments.size() != 2) {
+                        fail(expression.location, expression.text + " 需要两个参数");
+                    }
+                    const Type vector("vec");
+                    if (expressionType(*expression.arguments[0]) != vector ||
+                        expressionType(*expression.arguments[1]) != vector) {
+                        fail(expression.location, expression.text + " 参数必须都是 vec");
+                    }
+                    return TypeKind::Number;
+                }
+                if (expression.text == "getlink") {
+                    if (expression.arguments.size() != 1 || expressionType(*expression.arguments.front()) != TypeKind::Int) {
+                        fail(expression.location, "getlink 需要一个 int 参数");
+                    }
+                    return TypeKind::Building;
+                }
+                if (isBuiltinFunction(expression.text)) return TypeKind::Void;
+                const auto function = functions_.find(expression.text);
+                if (function == functions_.end()) fail(expression.location, "未定义的函数: " + expression.text);
+                const FunctionDecl& declaration = *function->second.declaration;
+                if (expression.arguments.size() != declaration.parameters.size()) {
+                    fail(expression.location, "函数 " + declaration.name + " 参数数量错误");
+                }
+                for (std::size_t index = 0; index < expression.arguments.size(); ++index) {
+                    if (expression.arguments[index]->kind != Expr::Kind::InitializerList) {
+                        requireAssignable(declaration.parameters[index].type,
+                                          expressionType(*expression.arguments[index]),
+                                          expression.arguments[index]->location);
+                    }
+                }
+                return function->second.declaration->returnType;
+            }
+            case Expr::Kind::Sizeof: return TypeKind::Int;
+            case Expr::Kind::InitializerList:
+                fail(expression.location, "无法确定无上下文初始化列表的类型");
+            case Expr::Kind::TypedInitializer:
+                validateInitializerType(expression, expression.declaredType);
+                return expression.declaredType;
+        }
+        fail(expression.location, "无法确定表达式类型");
+    }
+
+    ExpressionResult generateMember(const Expr& expression) {
+        const ExpressionResult object = generateExpression(*expression.left);
+        if (!object.type.isStruct()) fail(expression.location, "点号左侧必须是结构体");
+        const StructDecl& declaration = *structs_.at(object.type.structName);
+        std::size_t offset = 0;
+        for (const StructField& field : declaration.fields) {
+            const std::size_t fieldSize = typeSize(field.type);
+            if (field.name == expression.text) {
+                const std::vector<std::string> objectOperands = operandsOf(object);
+                std::vector<std::string> fieldOperands(objectOperands.begin() + static_cast<std::ptrdiff_t>(offset),
+                                                       objectOperands.begin() + static_cast<std::ptrdiff_t>(offset + fieldSize));
+                if (field.type.isStruct()) return {field.type, "", object.lvalue, std::move(fieldOperands)};
+                return {field.type, fieldOperands.front(), object.lvalue, {}};
+            }
+            offset += fieldSize;
+        }
+        fail(expression.location, "结构体 " + object.type.structName + " 没有字段 " + expression.text);
+    }
+
     ExpressionResult generateUnary(const Expr& expression) {
         ExpressionResult operand = generateExpression(*expression.right);
+        if (operand.type == Type("vec")) {
+            if (expression.text == "+") return {operand.type, "", false, operand.components};
+            if (expression.text == "-") {
+                std::vector<std::string> components;
+                for (const std::string& value : operand.components) {
+                    const std::string result = temporary();
+                    emitter_.emit("op", {"sub", result, "0", value});
+                    components.push_back(result);
+                }
+                return {operand.type, "", false, std::move(components)};
+            }
+        }
         if (expression.text == "!") {
             operand = toBoolean(std::move(operand), expression.location);
             const std::string result = temporary();
@@ -1267,7 +1956,7 @@ private:
         return {operand.type, result, false};
     }
 
-    static TypeKind commonNumericType(TypeKind left, TypeKind right, const std::string& operation) {
+    static Type commonNumericType(const Type& left, const Type& right, const std::string& operation) {
         if (operation == "/") return TypeKind::Number;
         if (left == TypeKind::Number || right == TypeKind::Number) return TypeKind::Number;
         if (left == TypeKind::Float || right == TypeKind::Float) return TypeKind::Float;
@@ -1279,6 +1968,9 @@ private:
 
         const ExpressionResult left = generateExpression(*expression.left);
         const ExpressionResult right = generateExpression(*expression.right);
+        if (left.type.isStruct() || right.type.isStruct()) {
+            return generateAggregateBinary(expression, left, right);
+        }
         const std::string result = temporary();
 
         static const std::unordered_map<std::string, std::string> comparisonOperations = {
@@ -1287,6 +1979,9 @@ private:
         };
         if (const auto comparison = comparisonOperations.find(expression.text);
             comparison != comparisonOperations.end()) {
+            if (left.type.isStruct() || right.type.isStruct()) {
+                fail(expression.location, "结构体暂不支持比较运算");
+            }
             if (expression.text == "==" || expression.text == "!=") {
                 const bool compatible = left.type == right.type ||
                                         (isNumeric(left.type) && isNumeric(right.type));
@@ -1313,6 +2008,57 @@ private:
         return {commonNumericType(left.type, right.type, expression.text), result, false};
     }
 
+    ExpressionResult generateAggregateBinary(const Expr& expression,
+                                               const ExpressionResult& left,
+                                               const ExpressionResult& right) {
+        const Type point("point");
+        const Type vector("vec");
+        Type resultType;
+        std::string operation;
+        bool leftScalar = false;
+        bool rightScalar = false;
+
+        if (expression.text == "+") {
+            if (left.type == vector && right.type == vector) resultType = vector;
+            else if ((left.type == point && right.type == vector) ||
+                     (left.type == vector && right.type == point)) resultType = point;
+            else fail(expression.location, "加法只支持 vec+vec、point+vec 或 vec+point");
+            operation = "add";
+        } else if (expression.text == "-") {
+            if (left.type == vector && right.type == vector) resultType = vector;
+            else if (left.type == point && right.type == vector) resultType = point;
+            else if (left.type == point && right.type == point) resultType = vector;
+            else fail(expression.location, "减法只支持 vec-vec、point-vec 或 point-point");
+            operation = "sub";
+        } else if (expression.text == "*") {
+            if (left.type == vector && isNumeric(right.type)) {
+                resultType = vector;
+                rightScalar = true;
+            } else if (isNumeric(left.type) && right.type == vector) {
+                resultType = vector;
+                leftScalar = true;
+            } else {
+                fail(expression.location, "乘法只支持 vec 与数值标量");
+            }
+            operation = "mul";
+        } else {
+            fail(expression.location, "该运算符不支持结构体操作数: " + expression.text);
+        }
+
+        const std::vector<std::string> leftOperands = operandsOf(left);
+        const std::vector<std::string> rightOperands = operandsOf(right);
+        std::vector<std::string> components;
+        components.reserve(2);
+        for (std::size_t index = 0; index < 2; ++index) {
+            const std::string result = temporary();
+            emitter_.emit("op", {operation, result,
+                                 leftScalar ? left.operand : leftOperands[index],
+                                 rightScalar ? right.operand : rightOperands[index]});
+            components.push_back(result);
+        }
+        return {resultType, "", false, std::move(components)};
+    }
+
     ExpressionResult generateLogical(const Expr& expression) {
         const std::string result = temporary();
         const std::string endLabel = uniqueLabel("logical_end");
@@ -1333,12 +2079,38 @@ private:
     ExpressionResult generateAssignment(const Expr& expression) {
         ExpressionResult destination = generateExpression(*expression.left);
         if (!destination.lvalue) fail(expression.location, "赋值左侧必须是可修改变量");
-        const ExpressionResult source = generateExpression(*expression.right);
 
         if (expression.text == "=") {
-            requireAssignable(destination.type, source.type, expression.location);
-            emitter_.emit("set", {destination.operand, source.operand});
-            return {destination.type, destination.operand, false};
+            ExpressionResult source = generateValue(*expression.right, destination.type);
+            if (destination.type.isStruct() || expression.right->kind == Expr::Kind::InitializerList) {
+                source = materialize(source);
+            }
+            const Symbol target{destination.type, destination.operand, true, destination.components};
+            assignValue(target, source);
+            return {destination.type, destination.operand, false, destination.components};
+        }
+
+        const ExpressionResult source = generateExpression(*expression.right);
+        if (destination.type.isStruct()) {
+            const Type point("point"), vector("vec");
+            std::string operation;
+            bool scalarSource = false;
+            if ((expression.text == "+=" || expression.text == "-=") &&
+                ((destination.type == vector && source.type == vector) ||
+                 (destination.type == point && source.type == vector))) {
+                operation = expression.text == "+=" ? "add" : "sub";
+            } else if (expression.text == "*=" && destination.type == vector && isNumeric(source.type)) {
+                operation = "mul";
+                scalarSource = true;
+            } else {
+                fail(expression.location, "该复合赋值不支持这些聚合类型");
+            }
+            const std::vector<std::string> sourceOperands = operandsOf(source);
+            for (std::size_t index = 0; index < destination.components.size(); ++index) {
+                emitter_.emit("op", {operation, destination.components[index], destination.components[index],
+                                     scalarSource ? source.operand : sourceOperands[index]});
+            }
+            return {destination.type, "", false, destination.components};
         }
 
         if (!isNumeric(destination.type) || !isNumeric(source.type)) {
@@ -1349,8 +2121,8 @@ private:
         };
         const auto operation = operations.find(expression.text);
         if (operation == operations.end()) fail(expression.location, "未知复合赋值运算符");
-        const TypeKind resultType = commonNumericType(destination.type, source.type,
-                                                      expression.text == "/=" ? "/" : expression.text.substr(0, 1));
+        const Type resultType = commonNumericType(destination.type, source.type,
+                                                  expression.text == "/=" ? "/" : expression.text.substr(0, 1));
         requireAssignable(destination.type, resultType, expression.location);
         if (expression.text == "%=" && (destination.type != TypeKind::Int || source.type != TypeKind::Int)) {
             fail(expression.location, "%= 只接受 int 操作数");
@@ -1376,8 +2148,30 @@ private:
     }
 
     ExpressionResult generateCall(const Expr& expression) {
+        if (builtinOpFunction(expression.text)) return generateBuiltinOp(expression);
         if (expression.text == "print") return generatePrint(expression);
+        if (expression.text == "printchar" || expression.text == "putchar") return generatePrintChar(expression);
+        if (expression.text == "format") return generateFormat(expression);
+        if (expression.text == "printf") return generatePrintf(expression);
         if (expression.text == "printflush") return generatePrintFlush(expression);
+        if (expression.text == "drawflush") return generateDrawFlush(expression);
+        if (expression.text == "wait") return generateWait(expression);
+        if (expression.text == "rgb" || expression.text == "rgba") return generateColor(expression);
+        if (expression.text == "pack_color" || expression.text == "unpack_color") return generateColorConversion(expression);
+        if (expression.text == "draw_clear") return generateDrawClear(expression);
+        if (expression.text == "draw_color" || expression.text == "set_color") return generateDrawColor(expression);
+        if (expression.text == "draw_col" || expression.text == "set_packed_color") return generateDrawCol(expression);
+        if (expression.text == "draw_stroke" || expression.text == "set_stroke") return generateDrawStroke(expression);
+        if (expression.text == "draw_line") return generateDrawLine(expression);
+        if (expression.text == "draw_rect" || expression.text == "draw_line_rect") return generateDrawRect(expression);
+        if (expression.text == "draw_poly" || expression.text == "draw_line_poly") return generateDrawPoly(expression);
+        if (expression.text == "draw_triangle") return generateDrawTriangle(expression);
+        if (expression.text == "draw_image") return generateDrawImage(expression);
+        if (expression.text == "draw_print") return generateDrawPrint(expression);
+        if (expression.text == "draw_translate" || expression.text == "draw_scale") return generateDrawTransform(expression);
+        if (expression.text == "draw_rotate") return generateDrawRotate(expression);
+        if (expression.text == "draw_reset") return generateDrawReset(expression);
+        if (expression.text == "dot" || expression.text == "cross") return generateVectorProduct(expression);
         if (expression.text == "getlink") return generateGetLink(expression);
 
         const auto functionIterator = functions_.find(expression.text);
@@ -1392,14 +2186,14 @@ private:
         std::vector<ExpressionResult> arguments;
         arguments.reserve(expression.arguments.size());
         for (std::size_t index = 0; index < expression.arguments.size(); ++index) {
-            ExpressionResult value = generateExpression(*expression.arguments[index]);
-            requireAssignable(function.parameters[index].type, value.type, expression.arguments[index]->location);
-            const std::string saved = temporary();
-            emitter_.emit("set", {saved, value.operand});
-            arguments.push_back({value.type, saved, false});
+            ExpressionResult value = generateValue(*expression.arguments[index], function.parameters[index].type);
+            arguments.push_back(materialize(value));
         }
         for (std::size_t index = 0; index < arguments.size(); ++index) {
-            emitter_.emit("set", {info.parameterStorage[index], arguments[index].operand});
+            const std::vector<std::string> values = operandsOf(arguments[index]);
+            for (std::size_t component = 0; component < values.size(); ++component) {
+                emitter_.emit("set", {info.parameterStorage[index][component], values[component]});
+            }
         }
 
         const std::string returnLabel = uniqueLabel("return_from_" + function.name);
@@ -1407,16 +2201,87 @@ private:
         emitter_.emit("jump", {reference(info.entryLabel), "always", "0", "0"});
         emitter_.label(returnLabel);
         if (function.returnType == TypeKind::Void) return {TypeKind::Void, "", false};
+        std::vector<std::string> results;
+        for (const std::string& resultStorage : info.resultStorage) {
+            const std::string result = temporary();
+            emitter_.emit("set", {result, resultStorage});
+            results.push_back(result);
+        }
+        if (function.returnType.isStruct()) return {function.returnType, "", false, std::move(results)};
+        return {function.returnType, results.front(), false, {}};
+    }
+
+    ExpressionResult generateBuiltinOp(const Expr& expression) {
+        const OpFunction function = *builtinOpFunction(expression.text);
+        const Type resultType = builtinOpType(expression);
+        std::string left;
+        std::string right = "0";
+
+        const bool coordinateOverload = expression.arguments.size() == 1 &&
+            (expression.text == "angle" || expression.text == "len" || expression.text == "noise");
+        if (coordinateOverload) {
+            const ExpressionResult value = generateExpression(*expression.arguments[0]);
+            left = value.components[0];
+            right = value.components[1];
+        } else {
+            std::vector<ExpressionResult> arguments;
+            arguments.reserve(expression.arguments.size());
+            for (const auto& argument : expression.arguments) arguments.push_back(generateExpression(*argument));
+            left = arguments[0].operand;
+            if (arguments.size() == 2) right = arguments[1].operand;
+        }
+
         const std::string result = temporary();
-        emitter_.emit("set", {result, info.resultStorage});
-        return {function.returnType, result, false};
+        emitter_.emit("op", {std::string(function.operation), result, left, right});
+        return {resultType, result, false};
     }
 
     ExpressionResult generatePrint(const Expr& expression) {
         if (expression.arguments.size() != 1) fail(expression.location, "print 需要一个参数");
         const ExpressionResult value = generateExpression(*expression.arguments.front());
-        if (value.type == TypeKind::Void) fail(expression.location, "不能打印 void 值");
+        if (value.type == TypeKind::Void || value.type.isStruct()) fail(expression.location, "不能直接打印该类型的值");
         emitter_.emit("print", {value.operand});
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generatePrintChar(const Expr& expression) {
+        if (expression.arguments.size() != 1) fail(expression.location, expression.text + " 需要一个参数");
+        const ExpressionResult value = generateExpression(*expression.arguments.front());
+        if (value.type != TypeKind::Int) {
+            fail(expression.location, expression.text + " 参数必须是 int，实际为 " + typeName(value.type));
+        }
+        emitter_.emit("printchar", {value.operand});
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateFormat(const Expr& expression) {
+        if (expression.arguments.size() != 1) fail(expression.location, "format 需要一个参数");
+        const ExpressionResult value = generateExpression(*expression.arguments.front());
+        if (value.type == TypeKind::Void || value.type.isStruct()) fail(expression.location, "format 不能接收该类型的值");
+        emitter_.emit("format", {value.operand});
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generatePrintf(const Expr& expression) {
+        if (expression.arguments.empty()) fail(expression.location, "printf 至少需要格式字符串参数");
+
+        std::vector<ExpressionResult> arguments;
+        arguments.reserve(expression.arguments.size());
+        for (const auto& argument : expression.arguments) {
+            const ExpressionResult value = generateExpression(*argument);
+            if (value.type == TypeKind::Void || value.type.isStruct()) fail(argument->location, "printf 不能接收该类型的值");
+            const std::string saved = temporary();
+            emitter_.emit("set", {saved, value.operand});
+            arguments.push_back({value.type, saved, false});
+        }
+        if (arguments.front().type != TypeKind::String) {
+            fail(expression.location, "printf 第一个参数必须是 string，实际为 " + typeName(arguments.front().type));
+        }
+
+        emitter_.emit("print", {arguments.front().operand});
+        for (std::size_t index = 1; index < arguments.size(); ++index) {
+            emitter_.emit("format", {arguments[index].operand});
+        }
         return {TypeKind::Void, "", false};
     }
 
@@ -1424,28 +2289,373 @@ private:
         if (expression.arguments.size() != 1) fail(expression.location, "printflush 需要一个参数");
         const Expr& targetExpression = *expression.arguments.front();
         if (targetExpression.kind == Expr::Kind::String) {
-            const std::string& linkName = targetExpression.text;
-            const bool validStart = !linkName.empty() &&
-                                    ((linkName.front() >= 'a' && linkName.front() <= 'z') ||
-                                     (linkName.front() >= 'A' && linkName.front() <= 'Z') ||
-                                     linkName.front() == '_');
-            const bool validRest = std::all_of(linkName.begin(), linkName.end(), [](char character) {
-                return (character >= 'a' && character <= 'z') ||
-                       (character >= 'A' && character <= 'Z') ||
-                       (character >= '0' && character <= '9') || character == '_';
-            });
-            if (!validStart || !validRest) {
-                fail(expression.location, "printflush 字符串字面量必须是有效的链接名称");
+            fail(expression.location, "printflush 不接受字符串字面量，请使用 message 标识符或正整数字面量");
+        }
+        if (targetExpression.kind == Expr::Kind::Number &&
+            targetExpression.text.find_first_of(".eE") == std::string::npos) {
+            long long index = 0;
+            const auto [end, error] = std::from_chars(targetExpression.text.data(),
+                                                      targetExpression.text.data() + targetExpression.text.size(),
+                                                      index);
+            if (error != std::errc{} || end != targetExpression.text.data() + targetExpression.text.size() || index <= 0) {
+                fail(expression.location, "printflush 信息板序号必须是正整数字面量");
             }
-            emitter_.emit("printflush", {linkName});
+            emitter_.emit("printflush", {"message" + std::to_string(index)});
             return {TypeKind::Void, "", false};
         }
         const ExpressionResult target = generateExpression(*expression.arguments.front());
         if (target.type != TypeKind::Message) {
-            fail(expression.location, "printflush 参数必须是 message 或字符串字面量，实际为 " + typeName(target.type));
+            fail(expression.location, "printflush 参数必须是 message 或正整数字面量，实际为 " + typeName(target.type));
         }
         emitter_.emit("printflush", {target.operand});
         return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawFlush(const Expr& expression) {
+        if (expression.arguments.size() != 1) fail(expression.location, "drawflush 需要一个参数");
+        const Expr& targetExpression = *expression.arguments.front();
+        if (targetExpression.kind == Expr::Kind::String) {
+            fail(expression.location, "drawflush 不接受字符串字面量，请使用 display 标识符或正整数字面量");
+        }
+        if (targetExpression.kind == Expr::Kind::Number &&
+            targetExpression.text.find_first_of(".eE") == std::string::npos) {
+            long long index = 0;
+            const auto [end, error] = std::from_chars(targetExpression.text.data(),
+                                                      targetExpression.text.data() + targetExpression.text.size(),
+                                                      index);
+            if (error != std::errc{} || end != targetExpression.text.data() + targetExpression.text.size() || index <= 0) {
+                fail(expression.location, "drawflush 显示屏序号必须是正整数字面量");
+            }
+            emitter_.emit("drawflush", {"display" + std::to_string(index)});
+            return {TypeKind::Void, "", false};
+        }
+        const ExpressionResult target = generateExpression(*expression.arguments.front());
+        if (target.type != TypeKind::Display) {
+            fail(expression.location, "drawflush 参数必须是 display 或正整数字面量，实际为 " + typeName(target.type));
+        }
+        emitter_.emit("drawflush", {target.operand});
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateWait(const Expr& expression) {
+        if (expression.arguments.size() != 1) fail(expression.location, "wait 需要一个参数");
+        const ExpressionResult duration = numericArgument(*expression.arguments[0], expression.text);
+        emitter_.emit("wait", {duration.operand});
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult numericArgument(const Expr& expression, std::string_view function) {
+        const ExpressionResult value = generateExpression(expression);
+        if (!isNumeric(value.type)) {
+            fail(expression.location, std::string(function) + " 参数必须是数值类型，实际为 " + typeName(value.type));
+        }
+        return value;
+    }
+
+    ExpressionResult intArgument(const Expr& expression, std::string_view function) {
+        const ExpressionResult value = generateExpression(expression);
+        if (value.type != TypeKind::Int) {
+            fail(expression.location, std::string(function) + " 参数必须是 int，实际为 " + typeName(value.type));
+        }
+        return value;
+    }
+
+    void emitDraw(std::string type, std::vector<std::string> parameters) {
+        if (parameters.size() > 6) throw std::logic_error("draw 参数数量超过六个");
+        parameters.resize(6, "0");
+        parameters.insert(parameters.begin(), std::move(type));
+        emitter_.emit("draw", std::move(parameters));
+    }
+
+    ExpressionResult generateColor(const Expr& expression) {
+        const std::size_t expected = expression.text == "rgb" ? 3 : 4;
+        if (expression.arguments.size() != expected) {
+            fail(expression.location, expression.text + " 需要 " + std::to_string(expected) + " 个参数");
+        }
+        std::vector<std::string> components;
+        components.reserve(4);
+        for (const auto& argument : expression.arguments) {
+            components.push_back(intArgument(*argument, expression.text).operand);
+        }
+        if (expected == 3) components.push_back("255");
+        return {Type("color"), "", false, std::move(components)};
+    }
+
+    ExpressionResult generateColorConversion(const Expr& expression) {
+        if (expression.text == "pack_color") {
+            std::vector<std::string> components;
+            if (expression.arguments.size() == 1) {
+                const ExpressionResult value = generateExpression(*expression.arguments[0]);
+                if (value.type != Type("color")) fail(expression.location, "pack_color 单参数形式需要 color");
+                components = value.components;
+            } else if (expression.arguments.size() == 3 || expression.arguments.size() == 4) {
+                components.reserve(4);
+                for (const auto& argument : expression.arguments) {
+                    components.push_back(intArgument(*argument, expression.text).operand);
+                }
+                if (components.size() == 3) components.push_back("255");
+            } else {
+                fail(expression.location, "pack_color 需要一个 color、三个 int 或四个 int 参数");
+            }
+            std::vector<std::string> normalized;
+            normalized.reserve(4);
+            for (const std::string& operand : components) {
+                const std::string component = temporary();
+                emitter_.emit("op", {"div", component, operand, "255"});
+                normalized.push_back(component);
+            }
+            const std::string result = temporary();
+            emitter_.emit("packcolor", {result, normalized[0], normalized[1], normalized[2], normalized[3]});
+            return {TypeKind::PackedColor, result, false};
+        }
+        if (expression.arguments.size() != 1) fail(expression.location, "unpack_color 需要一个参数");
+        const ExpressionResult value = generateExpression(*expression.arguments[0]);
+        if (value.type != TypeKind::PackedColor) fail(expression.location, "unpack_color 参数必须是 packed_color");
+        std::vector<std::string> components(4);
+        for (std::string& component : components) component = temporary();
+        emitter_.emit("unpackcolor", {components[0], components[1], components[2], components[3], value.operand});
+        for (std::string& component : components) {
+            emitter_.emit("op", {"mul", component, component, "255"});
+            emitter_.emit("op", {"round", component, component, "0"});
+        }
+        return {Type("color"), "", false, std::move(components)};
+    }
+
+    std::string drawAlphaOperand(std::string alpha) {
+        if (alpha == "0") {
+            alpha = temporary();
+            emitter_.emit("set", {alpha, "0"});
+        }
+        return alpha;
+    }
+
+    ExpressionResult generateDrawClear(const Expr& expression) {
+        if (expression.arguments.size() == 1) {
+            const ExpressionResult color = generateExpression(*expression.arguments[0]);
+            if (color.type != Type("color")) fail(expression.location, "draw_clear 单参数形式需要 color");
+            emitDraw("clear", {color.components[0], color.components[1], color.components[2]});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.arguments.size() != 3) fail(expression.location, "draw_clear 需要一个 color 或三个 int 参数");
+        std::vector<std::string> values;
+        for (const auto& argument : expression.arguments) values.push_back(intArgument(*argument, expression.text).operand);
+        emitDraw("clear", std::move(values));
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawColor(const Expr& expression) {
+        if (expression.arguments.size() == 1) {
+            const ExpressionResult color = generateExpression(*expression.arguments[0]);
+            if (color.type != Type("color")) fail(expression.location, expression.text + " 单参数形式需要 color");
+            emitDraw("color", {color.components[0], color.components[1], color.components[2],
+                                drawAlphaOperand(color.components[3])});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.arguments.size() != 4) fail(expression.location, expression.text + " 需要一个 color 或四个 int 参数");
+        std::vector<ExpressionResult> values;
+        values.reserve(4);
+        for (const auto& argument : expression.arguments) values.push_back(intArgument(*argument, expression.text));
+
+        const std::string alpha = drawAlphaOperand(values[3].operand);
+        emitDraw("color", {values[0].operand, values[1].operand, values[2].operand, alpha});
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawCol(const Expr& expression) {
+        if (expression.arguments.size() != 1) fail(expression.location, expression.text + " 需要一个 packed_color 参数");
+        const ExpressionResult color = generateExpression(*expression.arguments[0]);
+        if (color.type != TypeKind::PackedColor) fail(expression.location, expression.text + " 参数必须是 packed_color");
+        emitDraw("col", {color.operand});
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawStroke(const Expr& expression) {
+        if (expression.arguments.size() != 1) fail(expression.location, expression.text + " 需要一个参数");
+        const ExpressionResult width = generateExpression(*expression.arguments.front());
+        if (width.type != TypeKind::Int) {
+            fail(expression.location, expression.text + " 参数必须是 int，实际为 " + typeName(width.type));
+        }
+        emitDraw("stroke", {width.operand});
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawLine(const Expr& expression) {
+        std::vector<std::string> values;
+        if (expression.arguments.size() == 2) {
+            const ExpressionResult start = generateExpression(*expression.arguments[0]);
+            const ExpressionResult end = generateExpression(*expression.arguments[1]);
+            if (start.type != Type("point") || end.type != Type("point")) {
+                fail(expression.location, "draw_line 双参数形式需要两个 point");
+            }
+            values = {start.components[0], start.components[1], end.components[0], end.components[1]};
+        } else if (expression.arguments.size() == 4) {
+            for (const auto& argument : expression.arguments) values.push_back(numericArgument(*argument, expression.text).operand);
+        } else {
+            fail(expression.location, "draw_line 需要两个 point 或四个数值参数");
+        }
+        emitDraw("line", std::move(values));
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawRect(const Expr& expression) {
+        std::vector<std::string> values;
+        if (expression.arguments.size() == 1) {
+            const ExpressionResult rectangle = generateExpression(*expression.arguments[0]);
+            if (rectangle.type != Type("rect")) fail(expression.location, expression.text + " 单参数形式需要 rect");
+            const std::string width = temporary();
+            const std::string height = temporary();
+            emitter_.emit("op", {"sub", width, rectangle.components[2], rectangle.components[0]});
+            emitter_.emit("op", {"sub", height, rectangle.components[3], rectangle.components[1]});
+            values = {rectangle.components[0], rectangle.components[1], width, height};
+        } else if (expression.arguments.size() == 2) {
+            const ExpressionResult origin = generateExpression(*expression.arguments[0]);
+            const ExpressionResult size = generateExpression(*expression.arguments[1]);
+            if (origin.type != Type("point") || size.type != Type("vec")) {
+                fail(expression.location, expression.text + " 双参数形式需要 point 和 vec");
+            }
+            values = {origin.components[0], origin.components[1], size.components[0], size.components[1]};
+        } else if (expression.arguments.size() == 4) {
+            for (const auto& argument : expression.arguments) values.push_back(numericArgument(*argument, expression.text).operand);
+        } else {
+            fail(expression.location, expression.text + " 需要 rect、point/vec 或四个数值参数");
+        }
+        emitDraw(expression.text == "draw_rect" ? "rect" : "lineRect", std::move(values));
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawPoly(const Expr& expression) {
+        std::vector<std::string> values;
+        if (expression.arguments.size() == 4) {
+            const ExpressionResult center = generateExpression(*expression.arguments[0]);
+            if (center.type != Type("point")) fail(expression.location, expression.text + " 四参数形式的首参数必须是 point");
+            values = {center.components[0], center.components[1]};
+            values.push_back(intArgument(*expression.arguments[1], expression.text).operand);
+            values.push_back(numericArgument(*expression.arguments[2], expression.text).operand);
+            values.push_back(numericArgument(*expression.arguments[3], expression.text).operand);
+        } else if (expression.arguments.size() == 5) {
+            values.push_back(numericArgument(*expression.arguments[0], expression.text).operand);
+            values.push_back(numericArgument(*expression.arguments[1], expression.text).operand);
+            values.push_back(intArgument(*expression.arguments[2], expression.text).operand);
+            values.push_back(numericArgument(*expression.arguments[3], expression.text).operand);
+            values.push_back(numericArgument(*expression.arguments[4], expression.text).operand);
+        } else {
+            fail(expression.location, expression.text + " 需要 point 加三个参数，或五个标量参数");
+        }
+        emitDraw(expression.text == "draw_poly" ? "poly" : "linePoly", std::move(values));
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawTriangle(const Expr& expression) {
+        std::vector<std::string> values;
+        if (expression.arguments.size() == 3) {
+            for (const auto& argument : expression.arguments) {
+                const ExpressionResult point = generateExpression(*argument);
+                if (point.type != Type("point")) fail(expression.location, "draw_triangle 三参数形式需要三个 point");
+                values.insert(values.end(), point.components.begin(), point.components.end());
+            }
+        } else if (expression.arguments.size() == 6) {
+            for (const auto& argument : expression.arguments) values.push_back(numericArgument(*argument, expression.text).operand);
+        } else {
+            fail(expression.location, "draw_triangle 需要三个 point 或六个数值参数");
+        }
+        emitDraw("triangle", std::move(values));
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawImage(const Expr& expression) {
+        std::vector<std::string> values;
+        std::size_t sourceIndex = 0;
+        if (expression.arguments.size() == 4) {
+            const ExpressionResult center = generateExpression(*expression.arguments[0]);
+            if (center.type != Type("point")) fail(expression.location, "draw_image 四参数形式的首参数必须是 point");
+            values = {center.components[0], center.components[1]};
+            sourceIndex = 1;
+        } else if (expression.arguments.size() == 5) {
+            values.push_back(numericArgument(*expression.arguments[0], expression.text).operand);
+            values.push_back(numericArgument(*expression.arguments[1], expression.text).operand);
+            sourceIndex = 2;
+        } else {
+            fail(expression.location, "draw_image 需要 point/display/size/rotation 或五个标量参数");
+        }
+        const ExpressionResult source = generateExpression(*expression.arguments[sourceIndex]);
+        if (source.type != TypeKind::Display) {
+            fail(expression.arguments[sourceIndex]->location, "draw_image 当前只支持 display 图像源");
+        }
+        values.push_back(source.operand);
+        values.push_back(numericArgument(*expression.arguments[sourceIndex + 1], expression.text).operand);
+        values.push_back(numericArgument(*expression.arguments[sourceIndex + 2], expression.text).operand);
+        emitDraw("image", std::move(values));
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawPrint(const Expr& expression) {
+        std::vector<std::string> values;
+        if (expression.arguments.size() == 2) {
+            const ExpressionResult position = generateExpression(*expression.arguments[0]);
+            if (position.type != Type("point")) fail(expression.location, "draw_print 双参数形式需要 point 和 int");
+            values = {position.components[0], position.components[1], intArgument(*expression.arguments[1], expression.text).operand};
+        } else if (expression.arguments.size() == 3) {
+            values = {numericArgument(*expression.arguments[0], expression.text).operand,
+                      numericArgument(*expression.arguments[1], expression.text).operand,
+                      intArgument(*expression.arguments[2], expression.text).operand};
+        } else {
+            fail(expression.location, "draw_print 需要 point/int 或三个标量参数");
+        }
+        emitDraw("print", std::move(values));
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawTransform(const Expr& expression) {
+        std::vector<std::string> values;
+        if (expression.arguments.size() == 1) {
+            const ExpressionResult vector = generateExpression(*expression.arguments[0]);
+            if (vector.type != Type("vec")) fail(expression.location, expression.text + " 单参数形式需要 vec");
+            values = vector.components;
+        } else if (expression.arguments.size() == 2) {
+            values = {numericArgument(*expression.arguments[0], expression.text).operand,
+                      numericArgument(*expression.arguments[1], expression.text).operand};
+        } else {
+            fail(expression.location, expression.text + " 需要一个 vec 或两个数值参数");
+        }
+        emitDraw(expression.text == "draw_translate" ? "translate" : "scale", std::move(values));
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawRotate(const Expr& expression) {
+        if (expression.arguments.size() != 1) fail(expression.location, "draw_rotate 需要一个数值参数");
+        const ExpressionResult degrees = numericArgument(*expression.arguments[0], expression.text);
+        emitDraw("rotate", {"0", "0", degrees.operand});
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateDrawReset(const Expr& expression) {
+        if (!expression.arguments.empty()) fail(expression.location, "draw_reset 不接受参数");
+        emitDraw("reset", {});
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateVectorProduct(const Expr& expression) {
+        if (expression.arguments.size() != 2) fail(expression.location, expression.text + " 需要两个参数");
+        const ExpressionResult left = generateExpression(*expression.arguments[0]);
+        const ExpressionResult right = generateExpression(*expression.arguments[1]);
+        const Type vector("vec");
+        if (left.type != vector || right.type != vector) {
+            fail(expression.location, expression.text + " 参数必须都是 vec");
+        }
+
+        const std::string first = temporary();
+        const std::string second = temporary();
+        const std::string result = temporary();
+        if (expression.text == "dot") {
+            emitter_.emit("op", {"mul", first, left.components[0], right.components[0]});
+            emitter_.emit("op", {"mul", second, left.components[1], right.components[1]});
+            emitter_.emit("op", {"add", result, first, second});
+        } else {
+            emitter_.emit("op", {"mul", first, left.components[0], right.components[1]});
+            emitter_.emit("op", {"mul", second, left.components[1], right.components[0]});
+            emitter_.emit("op", {"sub", result, first, second});
+        }
+        return {TypeKind::Number, result, false};
     }
 
     ExpressionResult generateGetLink(const Expr& expression) {
@@ -1462,6 +2672,7 @@ private:
     const Program& program_;
     [[maybe_unused]] CompileOptions options_;
     Emitter emitter_;
+    std::unordered_map<std::string, const StructDecl*> structs_;
     std::unordered_map<std::string, FunctionInfo> functions_;
     std::vector<std::unordered_map<std::string, Symbol>> scopes_;
     const FunctionDecl* currentFunction_ = nullptr;
