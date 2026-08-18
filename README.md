@@ -148,7 +148,7 @@ sizeof(area)      // 4，且不会读取或修改 area
 
 ## 示例
 
-完整的彩色旋转线与五帧拖影示例见 [`examples/rotate_line.mdtc`](examples/rotate_line.mdtc)。
+完整的彩色旋转线与五帧拖影示例见 [`examples/rotate_line.mdtc`](examples/rotate_line.mdtc)。经典 2048 示例见 [`examples/2048.mdtc`](examples/2048.mdtc)，使用两个内存元、16 个普通逻辑显示屏、1 个大型逻辑显示屏和5个开关。
 
 ```cpp
 int add(int left, int right) {

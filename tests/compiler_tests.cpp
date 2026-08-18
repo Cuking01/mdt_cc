@@ -1,6 +1,7 @@
 #include "mdtc/compiler.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -123,6 +124,18 @@ private:
         if (operand == "false") return 0.0;
         if (operand == "null") return std::monostate{};
         if (!operand.empty() && operand.front() == '"') return decodeString(operand);
+        if ((operand.size() == 7 || operand.size() == 9) && operand.front() == '%') {
+            const auto component = [&](std::size_t offset, double fallback) {
+                unsigned value = 0;
+                const auto [end, error] = std::from_chars(operand.data() + offset,
+                                                           operand.data() + offset + 2, value, 16);
+                return error == std::errc{} && end == operand.data() + offset + 2
+                    ? static_cast<double>(value) / 255.0
+                    : fallback;
+            };
+            return ColorValue{component(1, 0), component(3, 0), component(5, 0),
+                              operand.size() == 9 ? component(7, 1) : 1};
+        }
         if (isNumberToken(operand)) return std::strtod(operand.c_str(), nullptr);
         const auto iterator = variables_.find(operand);
         if (iterator != variables_.end()) return iterator->second;
@@ -246,6 +259,15 @@ private:
         const std::string& opcode = instruction.at(0);
         if (opcode == "set") {
             write(instruction.at(1), read(instruction.at(2)));
+        } else if (opcode == "read") {
+            const std::string handle = printable(read(instruction.at(2)));
+            const auto address = static_cast<long long>(number(read(instruction.at(3))));
+            const auto iterator = memory_.find(handle + ":" + std::to_string(address));
+            write(instruction.at(1), iterator == memory_.end() ? Value{std::monostate{}} : iterator->second);
+        } else if (opcode == "write") {
+            const std::string handle = printable(read(instruction.at(2)));
+            const auto address = static_cast<long long>(number(read(instruction.at(3))));
+            memory_[handle + ":" + std::to_string(address)] = read(instruction.at(1));
         } else if (opcode == "op") {
             write(instruction.at(2), operation(instruction.at(1), read(instruction.at(3)), read(instruction.at(4))));
         } else if (opcode == "jump") {
@@ -303,6 +325,7 @@ private:
 
     std::vector<std::vector<std::string>> instructions_;
     std::unordered_map<std::string, Value> variables_;
+    std::unordered_map<std::string, Value> memory_;
     std::size_t counter_ = 0;
     std::string textBuffer_;
     std::vector<FlushEvent> flushes_;
@@ -360,6 +383,57 @@ void main_loop() {
     require(simulator.flushes().at(0).text == "total=10", "控制流或函数结果错误");
 }
 
+void testAutomaticInlining() {
+    const std::string profitableSource = R"(
+int state = -1;
+
+int classify(int value) {
+    if (value < 0) {
+        return 7;
+    }
+    return 9;
+}
+
+void main_loop() {
+    print(classify(state));
+    printflush(message1);
+    state = 1;
+}
+)";
+
+    const std::string profitableAssembly = mdtc::compile(profitableSource);
+    require(profitableAssembly.find("__function_classify_return_address") == std::string::npos,
+            "可缩短代码的函数没有被内联");
+    Simulator profitableSimulator(profitableAssembly);
+    profitableSimulator.runUntilFlushes(2);
+    require(profitableSimulator.flushes().at(0).text == "7", "内联函数第一个返回路径错误");
+    require(profitableSimulator.flushes().at(1).text == "9", "内联函数第二个返回路径错误");
+
+    const std::string unprofitableSource = R"(
+void verbose() {
+    print("a");
+    print("b");
+    print("c");
+    print("d");
+    print("e");
+}
+
+void main_loop() {
+    verbose();
+    verbose();
+    printflush(message1);
+}
+)";
+
+    const std::string unprofitableAssembly = mdtc::compile(unprofitableSource);
+    require(unprofitableAssembly.find("__function_verbose_return_address") != std::string::npos,
+            "不能缩短代码的函数不应被内联");
+    Simulator unprofitableSimulator(unprofitableAssembly);
+    unprofitableSimulator.runUntilFlushes(1);
+    require(unprofitableSimulator.flushes().at(0).text == "abcdeabcde",
+            "保留普通调用后函数语义错误");
+}
+
 void testGlobalPersistsAcrossMainLoop() {
     const std::string source = R"(
 extern message output;
@@ -376,6 +450,28 @@ void main_loop() {
     simulator.runUntilFlushes(2);
     require(simulator.flushes().at(0).text == "1", "第一次 main_loop 的全局变量错误");
     require(simulator.flushes().at(1).text == "2", "全局变量没有跨 main_loop 保留");
+}
+
+void testGlobalInitializerFunctionReachability() {
+    const std::string source = R"(
+int initialize() {
+    return 7;
+}
+
+int value = initialize();
+
+void main_loop() {
+    print(value);
+    printflush(message1);
+}
+)";
+
+    const std::string assembly = mdtc::compile(source);
+    require(assembly.find("__function_initialize_return_address") == std::string::npos,
+            "全局初始化阶段的函数调用没有参与内联");
+    Simulator simulator(assembly);
+    simulator.runUntilFlushes(1);
+    require(simulator.flushes().at(0).text == "7", "全局初始化调用的函数被错误删除");
 }
 
 void testWhileAndShortCircuit() {
@@ -403,6 +499,82 @@ void main_loop() {
     Simulator simulator(mdtc::compile(source));
     simulator.runUntilFlushes(1);
     require(simulator.flushes().at(0).text == "3", "while 或短路求值错误");
+}
+
+void testLoopCarriedValueAcrossEmptyBlocks() {
+    const std::string source = R"(
+int count_values() {
+    int count = 0;
+    for (int index = 0; index < 4; index++) {
+        if (index < 3) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+void main_loop() {
+    print(count_values());
+    printflush(message1);
+}
+)";
+
+    Simulator simulator(mdtc::compile(source));
+    simulator.runUntilFlushes(1);
+    require(simulator.flushes().at(0).text == "3",
+            "空基本块导致跨循环变量更新被错误删除");
+}
+
+void testValueAfterFunctionCallRemainsLive() {
+    const std::string source = R"(
+bool initialized = false;
+
+void initialize() {
+    print("init");
+}
+
+void main_loop() {
+    if (!initialized) {
+        initialize();
+        initialized = true;
+    }
+    printflush(message1);
+}
+)";
+
+    Simulator simulator(mdtc::compile(source));
+    simulator.runUntilFlushes(2);
+    require(simulator.flushes().at(0).text == "init", "初始化函数没有执行");
+    require(simulator.flushes().at(1).text.empty(),
+            "函数调用后的赋值被错误删除，初始化函数重复执行");
+}
+
+void testCalleeStateUpdatesRemainLive() {
+    const std::string source = R"(
+int total = 0;
+
+void accumulate(int value) {
+    if (value != 0) {
+        total += value;
+    }
+}
+
+void main_loop() {
+    accumulate(1);
+    accumulate(2);
+    accumulate(3);
+    accumulate(4);
+    print(total);
+    printflush(message1);
+}
+)";
+
+    const std::string assembly = mdtc::compile(source);
+    require(assembly.find("__function_accumulate_return_address") != std::string::npos,
+            "跨函数活跃性测试需要保留普通函数调用");
+    Simulator simulator(assembly);
+    simulator.runUntilFlushes(1);
+    require(simulator.flushes().at(0).text == "10", "被调函数中的状态更新被错误删除");
 }
 
 void testBasicTypes() {
@@ -442,6 +614,27 @@ void main_loop() {
     Simulator simulator(mdtc::compile(source));
     simulator.runUntilFlushes(1);
     require(simulator.flushes().at(0).text == "link2", "getlink 返回的链接错误");
+}
+
+void testBuiltinBuildingMemberMethods() {
+    const std::string source = R"(
+void main_loop() {
+    bool enabled = switch1.get_enabled();
+    switch1.enable(false);
+    switch2.enable(enabled);
+}
+)";
+
+    const std::string assembly = mdtc::compile(source);
+    require(assembly.find("sensor ") != std::string::npos,
+            "get_enabled 没有生成 sensor 指令");
+    require(assembly.find("sensor ") != std::string::npos &&
+                assembly.find(" @enabled\n") != std::string::npos,
+            "get_enabled 没有读取 enabled 属性");
+    require(assembly.find("control enabled switch1 false\n") != std::string::npos,
+            "enable(false) 没有生成 control 指令");
+    require(assembly.find("control enabled switch2 ") != std::string::npos,
+            "enable(bool) 没有生成 control 指令");
 }
 
 void testImplicitLinksAndPrintFlushIndex() {
@@ -603,6 +796,41 @@ void main_loop() {
     }
     require(simulator.flushes().at(0).text == "255,7:9:41",
             "类型化初始化、颜色打包或 draw_print 清缓冲语义错误");
+}
+
+void testConstantPackedColorFolding() {
+    const std::string source = R"(
+int red = 9;
+
+void main_loop() {
+    packed_color first = pack_color(1, 2, 3);
+    packed_color second = pack_color(4, 5, 6, 7);
+    packed_color third = pack_color(rgb(8, 9, 10));
+    packed_color fourth = pack_color(color{11, 12, 13, 14});
+    packed_color clamped = pack_color(-1, 256, 15, 300);
+    packed_color dynamic = pack_color(red, 10, 11);
+    set_packed_color(third);
+    set_packed_color(fourth);
+    set_packed_color(clamped);
+    set_packed_color(dynamic);
+    print(unpack_color(first).a);
+    print(",");
+    print(unpack_color(second).a);
+    printflush(message1);
+}
+)";
+
+    const std::string assembly = mdtc::compile(source);
+    require(assembly.find("%010203ff") != std::string::npos, "三分量常量颜色没有折叠");
+    require(assembly.find("%04050607") != std::string::npos, "四分量常量颜色没有折叠");
+    require(assembly.find("%08090aff") != std::string::npos, "rgb 常量颜色没有折叠");
+    require(assembly.find("%0b0c0d0e") != std::string::npos, "color 初始化常量没有折叠");
+    require(assembly.find("%00ff0fff") != std::string::npos, "常量颜色没有按运行时规则截断");
+    require(assembly.find("packcolor ") != std::string::npos, "运行期颜色被错误折叠");
+
+    Simulator simulator(assembly);
+    simulator.runUntilFlushes(1);
+    require(simulator.flushes().at(0).text == "255,7", "颜色字面量模拟语义错误");
 }
 
 void testEmptyStatementLoopBody() {
@@ -804,8 +1032,8 @@ void main_loop() {
     require(assembly.find("wait 0.01\n") != std::string::npos, "wait 没有生成原生指令");
     const std::vector<std::string> operations = {
         "idiv", "mod", "emod", "pow", "strictEqual", "shl", "shr", "ushr", "or", "and", "xor", "not",
-        "max", "min", "angle", "angleDiff", "len", "noise", "abs", "sign", "log", "logn", "log10",
-        "floor", "ceil", "round", "sqrt", "rand", "sin", "cos", "tan", "asin", "acos", "atan",
+        "max", "min", "angle", "angleDiff", "len", "abs", "sign", "log", "logn", "log10",
+        "floor", "ceil", "round", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan",
     };
     for (const std::string& operation : operations) {
         require(assembly.find("op " + operation + " ") != std::string::npos,
@@ -819,9 +1047,47 @@ void main_loop() {
             "op 内置函数运行语义错误");
 }
 
+void testMemoryArrays() {
+    const std::string source = R"(
+arr<int> values = {cell1, 3};
+arr2d<int> matrix = {bank1, 10, 8};
+void main_loop() {
+    values[2] = 10;
+    values[2] += 5;
+    matrix[2][3] = 7;
+    print(values[2]);
+    print(",");
+    print(matrix[2][3]);
+    printflush(message1);
+}
+)";
+    Simulator simulator(mdtc::compile(source));
+    simulator.runUntilFlushes(1);
+    require(simulator.flushes().at(0).text == "15,7", "memory 数组读写错误");
+
+    const std::string aggregateSource = R"(
+arr<point> points = {bank1, 100};
+void main_loop() {
+    points[2] = point{4, 5};
+    print(points[2].x);
+    print(",");
+    print(points[2].y);
+    printflush(message1);
+}
+)";
+    Simulator aggregateSimulator(mdtc::compile(aggregateSource));
+    aggregateSimulator.runUntilFlushes(1);
+    require(aggregateSimulator.flushes().at(0).text == "4,5", "聚合类型数组读写错误");
+}
+
 void testDiagnostics() {
+    const std::string deadFunctionAssembly =
+        mdtc::compile("void recurse() { recurse(); } void main_loop() {}");
+    require(deadFunctionAssembly.find("__function_recurse") == std::string::npos,
+            "未调用函数没有被删除");
+
     requireCompileError([] {
-        (void)mdtc::compile("void recurse() { recurse(); } void main_loop() {}");
+        (void)mdtc::compile("void recurse() { recurse(); } void main_loop() { recurse(); }");
     }, "递归调用");
 
     requireCompileError([] {
@@ -943,6 +1209,18 @@ void testDiagnostics() {
     requireCompileError([] {
         (void)mdtc::compile("void main_loop() { vec v = {}; print(cross(v)); }");
     }, "需要两个参数");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { arr<string> value = {}; }");
+    }, "数组元素类型不能存储");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { arr<int> value = {}; print(value[1.0]); }");
+    }, "数组索引必须是 int");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { arr2d<int> value = {}; value[1] = {}; }");
+    }, "赋值左侧必须是可修改变量");
 }
 
 } // namespace
@@ -950,21 +1228,29 @@ void testDiagnostics() {
 int main() {
     try {
         testFunctionsControlFlowAndPrint();
+        testAutomaticInlining();
         testGlobalPersistsAcrossMainLoop();
+        testGlobalInitializerFunctionReachability();
         testWhileAndShortCircuit();
+        testLoopCarriedValueAcrossEmptyBlocks();
+        testValueAfterFunctionCallRemainsLive();
+        testCalleeStateUpdatesRemainLive();
         testBasicTypes();
         testGetLink();
+        testBuiltinBuildingMemberMethods();
         testImplicitLinksAndPrintFlushIndex();
         testPrintCharFormatAndPrintf();
         testDrawFlush();
         testDrawColorAndStrokeAliases();
         testColorAndDrawCommands();
+        testConstantPackedColorFolding();
         testEmptyStatementLoopBody();
         testStructsInitializersFunctionsAndSizeof();
         testSizeofBuiltinTypes();
         testBuiltinPointVectorAndRect();
         testVectorDotAndCross();
         testOpBuiltinFunctions();
+        testMemoryArrays();
         testDiagnostics();
     } catch (const std::exception& error) {
         std::cerr << "测试失败: " << error.what() << '\n';

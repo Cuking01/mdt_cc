@@ -1,6 +1,7 @@
 #include "mdtc/compiler.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstddef>
@@ -49,6 +50,9 @@ enum class TokenKind {
     KwMessage,
     KwBuilding,
     KwDisplay,
+    KwMemory,
+    KwArr,
+    KwArr2d,
     KwColor,
     KwPackedColor,
     KwStruct,
@@ -67,6 +71,8 @@ enum class TokenKind {
     RightParen,
     LeftBrace,
     RightBrace,
+    LeftBracket,
+    RightBracket,
     Comma,
     Semicolon,
     Plus,
@@ -184,6 +190,9 @@ private:
             {"message", TokenKind::KwMessage}, {"extern", TokenKind::KwExtern},
             {"building", TokenKind::KwBuilding},
             {"display", TokenKind::KwDisplay},
+            {"memory", TokenKind::KwMemory},
+            {"arr", TokenKind::KwArr},
+            {"arr2d", TokenKind::KwArr2d},
             {"color", TokenKind::KwColor},
             {"packed_color", TokenKind::KwPackedColor},
             {"struct", TokenKind::KwStruct}, {"sizeof", TokenKind::KwSizeof},
@@ -254,6 +263,8 @@ private:
             case ')': return {TokenKind::RightParen, ")", start};
             case '{': return {TokenKind::LeftBrace, "{", start};
             case '}': return {TokenKind::RightBrace, "}", start};
+            case '[': return {TokenKind::LeftBracket, "[", start};
+            case ']': return {TokenKind::RightBracket, "]", start};
             case ',': return {TokenKind::Comma, ",", start};
             case ';': return {TokenKind::Semicolon, ";", start};
             case '+':
@@ -303,18 +314,30 @@ private:
     std::size_t column_ = 1;
 };
 
-enum class TypeKind { Void, Bool, Int, Float, Number, String, Message, Building, Display, PackedColor };
+enum class TypeKind {
+    Void, Bool, Int, Float, Number, String, Message, Building, Display, Memory,
+    PackedColor, Arr, Arr2d
+};
 
 struct Type {
     TypeKind kind = TypeKind::Void;
     std::string structName;
+    std::shared_ptr<Type> elementType;
 
     Type() = default;
     Type(TypeKind kindValue) : kind(kindValue) {}
     explicit Type(std::string name) : kind(TypeKind::Void), structName(std::move(name)) {}
+    Type(TypeKind kindValue, Type element)
+        : kind(kindValue), elementType(std::make_shared<Type>(std::move(element))) {}
 
     [[nodiscard]] bool isStruct() const { return !structName.empty(); }
-    bool operator==(const Type&) const = default;
+    [[nodiscard]] bool isArray() const { return kind == TypeKind::Arr || kind == TypeKind::Arr2d; }
+    [[nodiscard]] bool isRuntimeAggregate() const { return isStruct() || isArray(); }
+    bool operator==(const Type& other) const {
+        if (kind != other.kind || structName != other.structName) return false;
+        if (elementType == nullptr || other.elementType == nullptr) return elementType == other.elementType;
+        return *elementType == *other.elementType;
+    }
     friend bool operator==(const Type& type, TypeKind kind) { return !type.isStruct() && type.kind == kind; }
     friend bool operator==(TypeKind kind, const Type& type) { return type == kind; }
 };
@@ -331,7 +354,10 @@ std::string typeName(const Type& type) {
         case TypeKind::Message: return "message";
         case TypeKind::Building: return "building";
         case TypeKind::Display: return "display";
+        case TypeKind::Memory: return "memory";
         case TypeKind::PackedColor: return "packed_color";
+        case TypeKind::Arr: return "arr<" + typeName(*type.elementType) + ">";
+        case TypeKind::Arr2d: return "arr2d<" + typeName(*type.elementType) + ">";
     }
     return "<unknown>";
 }
@@ -404,6 +430,7 @@ std::optional<Type> implicitLinkType(std::string_view name) {
     if (!prefixes.contains(prefix)) return std::nullopt;
     if (prefix == "message") return TypeKind::Message;
     if (prefix == "display") return TypeKind::Display;
+    if (prefix == "cell" || prefix == "bank") return TypeKind::Memory;
     return TypeKind::Building;
 }
 
@@ -425,7 +452,7 @@ bool isBuiltinFunction(std::string_view name) {
 
 struct Expr {
     enum class Kind { Number, String, Boolean, Variable, Unary, Binary, Assign, Call, Prefix, Postfix,
-                      Member, InitializerList, TypedInitializer, Sizeof };
+                      Member, Index, InitializerList, TypedInitializer, Sizeof };
 
     Kind kind = Kind::Number;
     SourceLocation location;
@@ -433,6 +460,7 @@ struct Expr {
     bool boolean = false;
     std::unique_ptr<Expr> left;
     std::unique_ptr<Expr> right;
+    std::unique_ptr<Expr> receiver;
     std::vector<std::unique_ptr<Expr>> arguments;
     Type declaredType;
 };
@@ -566,12 +594,26 @@ private:
                kind == TokenKind::KwDouble ||
                kind == TokenKind::KwNumber || kind == TokenKind::KwString ||
                kind == TokenKind::KwMessage || kind == TokenKind::KwBuilding ||
-               kind == TokenKind::KwDisplay || kind == TokenKind::KwColor ||
+               kind == TokenKind::KwDisplay || kind == TokenKind::KwMemory ||
+               kind == TokenKind::KwArr || kind == TokenKind::KwArr2d ||
+               kind == TokenKind::KwColor ||
                kind == TokenKind::KwPackedColor ||
                (kind == TokenKind::Identifier && structTypes_.contains(current().text));
     }
 
     bool isTypedInitializerStart() const {
+        if (current().kind == TokenKind::KwArr || current().kind == TokenKind::KwArr2d) {
+            std::size_t cursor = position_ + 1;
+            if (cursor >= tokens_.size() || tokens_[cursor].kind != TokenKind::Less) return false;
+            int depth = 0;
+            for (; cursor < tokens_.size(); ++cursor) {
+                if (tokens_[cursor].kind == TokenKind::Less) ++depth;
+                else if (tokens_[cursor].kind == TokenKind::Greater && --depth == 0) {
+                    return cursor + 1 < tokens_.size() && tokens_[cursor + 1].kind == TokenKind::LeftBrace;
+                }
+            }
+            return false;
+        }
         return isTypeToken(current().kind) && checkNext(TokenKind::LeftBrace);
     }
 
@@ -589,6 +631,15 @@ private:
             case TokenKind::KwMessage: return TypeKind::Message;
             case TokenKind::KwBuilding: return TypeKind::Building;
             case TokenKind::KwDisplay: return TypeKind::Display;
+            case TokenKind::KwMemory: return TypeKind::Memory;
+            case TokenKind::KwArr:
+            case TokenKind::KwArr2d: {
+                consume(TokenKind::Less, token.text + " 后需要 <元素类型>");
+                const Type element = parseType();
+                consume(TokenKind::Greater, token.text + " 的元素类型后需要 >");
+                if (element == TypeKind::Void) fail(token, token.text + " 的元素不能是 void");
+                return Type(token.kind == TokenKind::KwArr ? TypeKind::Arr : TypeKind::Arr2d, element);
+            }
             case TokenKind::KwColor: return Type("color");
             case TokenKind::KwPackedColor: return TypeKind::PackedColor;
             case TokenKind::Identifier:
@@ -877,11 +928,16 @@ private:
         auto expression = parsePrimary();
         for (;;) {
             if (match(TokenKind::LeftParen)) {
-                if (expression->kind != Expr::Kind::Variable) fail(previous(), "只能调用具名函数");
+                if (expression->kind != Expr::Kind::Variable && expression->kind != Expr::Kind::Member) {
+                    fail(previous(), "只能调用具名函数或内置成员函数");
+                }
                 auto call = std::make_unique<Expr>();
                 call->kind = Expr::Kind::Call;
                 call->location = expression->location;
                 call->text = expression->text;
+                if (expression->kind == Expr::Kind::Member) {
+                    call->receiver = std::move(expression->left);
+                }
                 if (!check(TokenKind::RightParen)) {
                     do {
                         call->arguments.push_back(parseExpression());
@@ -905,6 +961,15 @@ private:
                 member->text = memberName.text;
                 member->left = std::move(expression);
                 expression = std::move(member);
+            } else if (match(TokenKind::LeftBracket)) {
+                const Token bracket = previous();
+                auto index = std::make_unique<Expr>();
+                index->kind = Expr::Kind::Index;
+                index->location = bracket.location;
+                index->left = std::move(expression);
+                index->right = parseExpression();
+                consume(TokenKind::RightBracket, "索引表达式缺少右方括号");
+                expression = std::move(index);
             } else {
                 break;
             }
@@ -991,38 +1056,94 @@ private:
     std::unordered_set<std::string> structTypes_;
 };
 
-struct Instruction {
+struct IrInstruction {
+    enum class Kind { Operation, Label };
+    enum class OperandRole { Definition, Value, Label, Metadata };
+
+    Kind kind = Kind::Operation;
     std::string opcode;
+    std::string label;
     std::vector<std::string> operands;
+    std::vector<OperandRole> operandRoles;
+
+    bool operator==(const IrInstruction&) const = default;
+
+    [[nodiscard]] bool isTerminator() const {
+        return kind == Kind::Operation &&
+               (opcode == "jump" ||
+                (opcode == "set" && !operands.empty() && operands.front() == "@counter"));
+    }
+
+    [[nodiscard]] bool hasSideEffects() const {
+        if (kind == Kind::Label) return false;
+        if (isTerminator()) return true;
+        return opcode != "set" && opcode != "op" && opcode != "read" &&
+               opcode != "getlink" && opcode != "packcolor" && opcode != "unpackcolor";
+    }
+
+    [[nodiscard]] std::vector<std::size_t> definitions() const {
+        std::vector<std::size_t> result;
+        for (std::size_t index = 0; index < operandRoles.size(); ++index) {
+            if (operandRoles[index] == OperandRole::Definition) result.push_back(index);
+        }
+        return result;
+    }
+
+    [[nodiscard]] std::vector<std::size_t> uses() const {
+        std::vector<std::size_t> result;
+        for (std::size_t index = 0; index < operandRoles.size(); ++index) {
+            if (operandRoles[index] == OperandRole::Value) result.push_back(index);
+        }
+        return result;
+    }
 };
 
-class Emitter {
+struct IrBasicBlock {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+    std::vector<std::size_t> successors;
+};
+
+class IrBuilder {
 public:
     void label(const std::string& name) {
         if (!labels_.emplace(name, instructions_.size()).second) {
             throw std::logic_error("重复的内部标签: " + name);
         }
+        instructions_.push_back({IrInstruction::Kind::Label, {}, name, {}, {}});
     }
 
     void emit(std::string opcode, std::vector<std::string> operands = {}) {
-        instructions_.push_back({std::move(opcode), std::move(operands)});
+        std::vector<IrInstruction::OperandRole> roles = operandRoles(opcode, operands.size());
+        instructions_.push_back({IrInstruction::Kind::Operation, std::move(opcode), {},
+                                 std::move(operands), std::move(roles)});
     }
 
     [[nodiscard]] std::string finish() const {
-        if (instructions_.size() > 1000) {
+        std::unordered_map<std::string, std::size_t> instructionLabels;
+        std::size_t instructionCount = 0;
+        for (const IrInstruction& instruction : instructions_) {
+            if (instruction.kind == IrInstruction::Kind::Label) {
+                instructionLabels.emplace(instruction.label, instructionCount);
+            } else {
+                ++instructionCount;
+            }
+        }
+        if (instructionCount > 1000) {
             throw CompileError(1, 1, "生成的程序超过 Mindustry 1000 条指令限制（当前 " +
-                                             std::to_string(instructions_.size()) + " 条）");
+                                             std::to_string(instructionCount) + " 条）");
         }
 
         std::ostringstream output;
-        for (const Instruction& instruction : instructions_) {
+        for (const IrInstruction& instruction : instructions_) {
+            if (instruction.kind == IrInstruction::Kind::Label) continue;
             output << instruction.opcode;
             for (const std::string& operand : instruction.operands) {
                 output << ' ';
                 if (!operand.empty() && operand.front() == '$') {
                     const std::string labelName = operand.substr(1);
-                    const auto iterator = labels_.find(labelName);
-                    if (iterator == labels_.end()) {
+                    const auto iterator = instructionLabels.find(labelName);
+                    if (iterator == instructionLabels.end()) {
                         throw std::logic_error("未定义的内部标签: " + labelName);
                     }
                     output << iterator->second;
@@ -1035,8 +1156,415 @@ public:
         return output.str();
     }
 
+    [[nodiscard]] const std::vector<IrInstruction>& instructions() const { return instructions_; }
+    [[nodiscard]] std::size_t operationCount() const {
+        return static_cast<std::size_t>(std::count_if(
+            instructions_.begin(), instructions_.end(), [](const IrInstruction& instruction) {
+                return instruction.kind == IrInstruction::Kind::Operation;
+            }));
+    }
+
+    void optimizeInlining(const std::vector<std::string>& functionOrder) {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const std::string& functionName : functionOrder) {
+                const std::string entryLabel = "__function_" + functionName;
+                if (!containsLabel(entryLabel)) continue;
+
+                IrBuilder candidate = *this;
+                if (!candidate.inlineAllCalls(entryLabel, functionName)) continue;
+                candidate.optimizeLocalAssignments();
+                if (candidate.operationCount() < operationCount()) {
+                    *this = std::move(candidate);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    [[nodiscard]] std::vector<IrBasicBlock> basicBlocks() const {
+        if (instructions_.empty()) return {};
+        std::vector<bool> starts(instructions_.size(), false);
+        starts[0] = true;
+        std::unordered_map<std::string, std::size_t> labelPositions;
+        for (std::size_t index = 0; index < instructions_.size(); ++index) {
+            const IrInstruction& instruction = instructions_[index];
+            if (instruction.kind == IrInstruction::Kind::Label) {
+                starts[index] = true;
+                labelPositions[instruction.label] = index;
+            } else if (instruction.opcode == "jump" ||
+                       (instruction.opcode == "set" && !instruction.operands.empty() &&
+                        instruction.operands.front() == "@counter")) {
+                if (index + 1 < instructions_.size()) starts[index + 1] = true;
+            }
+        }
+
+        std::vector<IrBasicBlock> blocks;
+        std::vector<std::size_t> blockAt(instructions_.size());
+        for (std::size_t index = 0; index < instructions_.size();) {
+            if (!starts[index]) {
+                ++index;
+                continue;
+            }
+            const std::size_t end = [&] {
+                std::size_t cursor = index + 1;
+                while (cursor < instructions_.size() && !starts[cursor]) ++cursor;
+                return cursor;
+            }();
+            const std::size_t block = blocks.size();
+            blocks.push_back({index, end, {}});
+            for (std::size_t cursor = index; cursor < end; ++cursor) blockAt[cursor] = block;
+            index = end;
+        }
+
+        std::unordered_map<std::string, std::vector<std::size_t>> returnContinuations;
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            const IrInstruction* terminal = nullptr;
+            for (std::size_t index = blocks[block].end; index > blocks[block].begin; --index) {
+                if (instructions_[index - 1].kind == IrInstruction::Kind::Operation) {
+                    terminal = &instructions_[index - 1];
+                    break;
+                }
+            }
+            if (terminal != nullptr && terminal->opcode == "jump" &&
+                !terminal->operands.empty() &&
+                terminal->operands.front().starts_with("$__function_") &&
+                block + 1 < blocks.size()) {
+                returnContinuations[terminal->operands.front().substr(1) + "_return_address"]
+                    .push_back(block + 1);
+            }
+        }
+
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            IrBasicBlock& current = blocks[block];
+            const IrInstruction* terminal = nullptr;
+            for (std::size_t index = current.end; index > current.begin; --index) {
+                if (instructions_[index - 1].kind == IrInstruction::Kind::Operation) {
+                    terminal = &instructions_[index - 1];
+                    break;
+                }
+            }
+            if (terminal != nullptr && terminal->opcode == "jump" && !terminal->operands.empty()) {
+                if (!terminal->operands.front().empty() && terminal->operands.front().front() == '$') {
+                    const auto target = labelPositions.find(terminal->operands.front().substr(1));
+                    if (target != labelPositions.end()) current.successors.push_back(blockAt[target->second]);
+                }
+                const bool functionCall = terminal->operands.front().starts_with("$__function_");
+                if (block + 1 < blocks.size() &&
+                    (functionCall ||
+                     (terminal->operands.size() >= 2 && terminal->operands[1] != "always"))) {
+                    current.successors.push_back(block + 1);
+                }
+            } else if (terminal != nullptr && terminal->opcode == "set" &&
+                       terminal->operands.size() >= 2 && terminal->operands.front() == "@counter") {
+                const auto continuations = returnContinuations.find(terminal->operands[1]);
+                if (continuations != returnContinuations.end()) {
+                    current.successors.insert(current.successors.end(), continuations->second.begin(),
+                                              continuations->second.end());
+                }
+            } else if (block + 1 < blocks.size()) {
+                current.successors.push_back(block + 1);
+            }
+        }
+        return blocks;
+    }
+
+    void optimizeLocalAssignments() {
+        while (true) {
+            const std::vector<IrInstruction> previous = instructions_;
+            optimizeLocalAssignmentsPass();
+            if (instructions_ == previous) return;
+        }
+    }
+
+    void optimizeLocalAssignmentsPass() {
+        const std::vector<IrBasicBlock> initialBlocks = basicBlocks();
+        for (const IrBasicBlock& block : initialBlocks) {
+            std::unordered_map<std::string, std::string> copies;
+            const auto kill = [&](const std::string& name) {
+                copies.erase(name);
+                for (auto iterator = copies.begin(); iterator != copies.end();) {
+                    if (iterator->second == name) iterator = copies.erase(iterator);
+                    else ++iterator;
+                }
+            };
+            const auto resolve = [&](const std::string& value) {
+                std::string result = value;
+                std::unordered_set<std::string> visited;
+                while (true) {
+                    const auto iterator = copies.find(result);
+                    if (iterator == copies.end() || !visited.insert(result).second) return result;
+                    result = iterator->second;
+                }
+            };
+            for (std::size_t index = block.begin; index < block.end; ++index) {
+                IrInstruction& instruction = instructions_[index];
+                if (instruction.kind == IrInstruction::Kind::Label) {
+                    copies.clear();
+                    continue;
+                }
+                for (std::size_t operand = 0; operand < instruction.operands.size(); ++operand) {
+                    if (instruction.opcode != "draw" && operand < instruction.operandRoles.size() &&
+                        instruction.operandRoles[operand] == IrInstruction::OperandRole::Value) {
+                        instruction.operands[operand] = resolve(instruction.operands[operand]);
+                    }
+                }
+                const std::vector<std::size_t> definitions = instruction.definitions();
+                if (instruction.opcode == "set" && definitions.size() == 1 && instruction.operands.size() >= 2) {
+                    const std::string destination = instruction.operands[definitions.front()];
+                    const std::string source = resolve(instruction.operands[1]);
+                    if (destination == source) {
+                        instruction.opcode.clear();
+                        instruction.operands.clear();
+                        instruction.operandRoles.clear();
+                    } else {
+                        kill(destination);
+                        copies[destination] = source;
+                    }
+                } else {
+                    for (const std::size_t definition : definitions) {
+                        if (definition < instruction.operands.size()) kill(instruction.operands[definition]);
+                    }
+                }
+                if (instruction.isTerminator()) copies.clear();
+            }
+        }
+
+        const std::vector<IrBasicBlock> blocks = basicBlocks();
+        std::vector<std::unordered_set<std::string>> uses(blocks.size());
+        std::vector<std::unordered_set<std::string>> definitions(blocks.size());
+        std::vector<std::unordered_set<std::string>> liveIn(blocks.size());
+        std::vector<std::unordered_set<std::string>> liveOut(blocks.size());
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            for (std::size_t index = blocks[block].begin; index < blocks[block].end; ++index) {
+                const IrInstruction& instruction = instructions_[index];
+                if (instruction.kind == IrInstruction::Kind::Label) continue;
+                for (const std::size_t operand : instruction.uses()) {
+                    if (operand < instruction.operands.size() && !definitions[block].contains(instruction.operands[operand])) {
+                        uses[block].insert(instruction.operands[operand]);
+                    }
+                }
+                for (const std::size_t operand : instruction.definitions()) {
+                    if (operand < instruction.operands.size()) definitions[block].insert(instruction.operands[operand]);
+                }
+            }
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (std::size_t block = blocks.size(); block-- > 0;) {
+                std::unordered_set<std::string> nextOut;
+                for (const std::size_t successor : blocks[block].successors) {
+                    nextOut.insert(liveIn[successor].begin(), liveIn[successor].end());
+                }
+                std::unordered_set<std::string> nextIn = uses[block];
+                for (const std::string& name : nextOut) {
+                    if (!definitions[block].contains(name)) nextIn.insert(name);
+                }
+                if (nextOut != liveOut[block] || nextIn != liveIn[block]) {
+                    liveOut[block] = std::move(nextOut);
+                    liveIn[block] = std::move(nextIn);
+                    changed = true;
+                }
+            }
+        }
+
+        for (std::size_t block = 0; block < blocks.size(); ++block) {
+            std::unordered_set<std::string> live = liveOut[block];
+            bool dynamicReturn = false;
+            bool functionCall = false;
+            for (std::size_t cursor = blocks[block].end; cursor > blocks[block].begin; --cursor) {
+                const IrInstruction& terminal = instructions_[cursor - 1];
+                if (terminal.kind != IrInstruction::Kind::Operation) continue;
+                dynamicReturn = terminal.opcode == "set" && !terminal.operands.empty() &&
+                                terminal.operands.front() == "@counter";
+                functionCall = terminal.opcode == "jump" && !terminal.operands.empty() &&
+                               terminal.operands.front().starts_with("$__function_");
+                break;
+            }
+            if (dynamicReturn || functionCall) {
+                for (std::size_t index = blocks[block].begin; index < blocks[block].end; ++index) {
+                    for (const std::size_t operand : instructions_[index].definitions()) {
+                        if (operand < instructions_[index].operands.size()) {
+                            live.insert(instructions_[index].operands[operand]);
+                        }
+                    }
+                }
+            }
+            for (std::size_t index = blocks[block].end; index-- > blocks[block].begin;) {
+                IrInstruction& instruction = instructions_[index];
+                if (instruction.kind == IrInstruction::Kind::Label) continue;
+                const std::vector<std::size_t> instructionDefinitions = instruction.definitions();
+                bool removable = !dynamicReturn && !functionCall && !instruction.hasSideEffects() &&
+                                 !instructionDefinitions.empty();
+                for (const std::size_t operand : instructionDefinitions) {
+                    if (operand >= instruction.operands.size() || live.contains(instruction.operands[operand])) {
+                        removable = false;
+                    }
+                }
+                if (removable) {
+                    instruction.opcode.clear();
+                    instruction.operands.clear();
+                    instruction.operandRoles.clear();
+                    continue;
+                }
+                for (const std::size_t operand : instructionDefinitions) {
+                    if (operand < instruction.operands.size()) live.erase(instruction.operands[operand]);
+                }
+                for (const std::size_t operand : instruction.uses()) {
+                    if (operand < instruction.operands.size()) live.insert(instruction.operands[operand]);
+                }
+            }
+        }
+
+        instructions_.erase(std::remove_if(instructions_.begin(), instructions_.end(),
+                                           [](const IrInstruction& instruction) {
+                                               return instruction.kind == IrInstruction::Kind::Operation &&
+                                                      instruction.opcode.empty();
+                                           }), instructions_.end());
+    }
+
 private:
-    std::vector<Instruction> instructions_;
+    [[nodiscard]] bool containsLabel(const std::string& labelName) const {
+        return std::any_of(instructions_.begin(), instructions_.end(), [&](const IrInstruction& instruction) {
+            return instruction.kind == IrInstruction::Kind::Label && instruction.label == labelName;
+        });
+    }
+
+    bool inlineAllCalls(const std::string& entryLabel, const std::string& functionName) {
+        const auto entry = std::find_if(instructions_.begin(), instructions_.end(),
+                                        [&](const IrInstruction& instruction) {
+                                            return instruction.kind == IrInstruction::Kind::Label &&
+                                                   instruction.label == entryLabel;
+                                        });
+        if (entry == instructions_.end()) return false;
+        const std::size_t bodyBegin = static_cast<std::size_t>(entry - instructions_.begin()) + 1;
+        std::size_t bodyEnd = bodyBegin;
+        while (bodyEnd < instructions_.size()) {
+            const IrInstruction& instruction = instructions_[bodyEnd];
+            if (instruction.kind == IrInstruction::Kind::Label &&
+                (instruction.label.starts_with("__function_") ||
+                 instruction.label == "__main_loop_entry")) {
+                break;
+            }
+            ++bodyEnd;
+        }
+        const std::vector<IrInstruction> body(instructions_.begin() + static_cast<std::ptrdiff_t>(bodyBegin),
+                                              instructions_.begin() + static_cast<std::ptrdiff_t>(bodyEnd));
+        const std::string returnAddress = "__function_" + functionName + "_return_address";
+        const std::string callTarget = "$" + entryLabel;
+
+        std::vector<IrInstruction> rewritten;
+        rewritten.reserve(instructions_.size());
+        bool foundCall = false;
+        std::size_t cloneIndex = 0;
+        for (std::size_t index = 0; index < instructions_.size(); ++index) {
+            const IrInstruction& instruction = instructions_[index];
+            const bool call = instruction.kind == IrInstruction::Kind::Operation &&
+                              instruction.opcode == "jump" && !instruction.operands.empty() &&
+                              instruction.operands.front() == callTarget;
+            if (!call) {
+                rewritten.push_back(instruction);
+                continue;
+            }
+            if (rewritten.empty()) throw std::logic_error("函数调用缺少返回地址设置");
+            const IrInstruction& returnSetup = rewritten.back();
+            if (returnSetup.kind != IrInstruction::Kind::Operation || returnSetup.opcode != "set" ||
+                returnSetup.operands.size() < 2 || returnSetup.operands[0] != returnAddress ||
+                returnSetup.operands[1].empty() || returnSetup.operands[1].front() != '$') {
+                throw std::logic_error("无法识别函数调用返回地址");
+            }
+
+            foundCall = true;
+            const std::string callReturnLabel = returnSetup.operands[1].substr(1);
+            const std::string clonePrefix = "__inline_" + functionName + '_' +
+                                            std::to_string(cloneIndex++) + '_';
+            std::unordered_map<std::string, std::string> renamedLabels;
+            for (const IrInstruction& bodyInstruction : body) {
+                if (bodyInstruction.kind == IrInstruction::Kind::Label) {
+                    renamedLabels.emplace(bodyInstruction.label, clonePrefix + bodyInstruction.label);
+                }
+            }
+            for (IrInstruction bodyInstruction : body) {
+                if (bodyInstruction.kind == IrInstruction::Kind::Label) {
+                    bodyInstruction.label = renamedLabels.at(bodyInstruction.label);
+                } else {
+                    for (std::string& operand : bodyInstruction.operands) {
+                        if (operand.empty() || operand.front() != '$') continue;
+                        const auto renamed = renamedLabels.find(operand.substr(1));
+                        if (renamed != renamedLabels.end()) operand = "$" + renamed->second;
+                    }
+                    if (bodyInstruction.opcode == "set" && bodyInstruction.operands.size() >= 2 &&
+                        bodyInstruction.operands[0] == "@counter" &&
+                        bodyInstruction.operands[1] == returnAddress) {
+                        bodyInstruction.opcode = "jump";
+                        bodyInstruction.operands = {"$" + callReturnLabel, "always", "0", "0"};
+                        bodyInstruction.operandRoles = operandRoles(bodyInstruction.opcode,
+                                                                    bodyInstruction.operands.size());
+                    }
+                }
+                rewritten.push_back(std::move(bodyInstruction));
+            }
+        }
+        if (!foundCall) return false;
+
+        const auto rewrittenEntry = std::find_if(rewritten.begin(), rewritten.end(),
+                                                  [&](const IrInstruction& instruction) {
+                                                      return instruction.kind == IrInstruction::Kind::Label &&
+                                                             instruction.label == entryLabel;
+                                                  });
+        if (rewrittenEntry == rewritten.end()) throw std::logic_error("内联后函数入口丢失");
+        auto rewrittenEnd = rewrittenEntry + 1;
+        while (rewrittenEnd != rewritten.end()) {
+            if (rewrittenEnd->kind == IrInstruction::Kind::Label &&
+                (rewrittenEnd->label.starts_with("__function_") ||
+                 rewrittenEnd->label == "__main_loop_entry")) {
+                break;
+            }
+            ++rewrittenEnd;
+        }
+        rewritten.erase(rewrittenEntry, rewrittenEnd);
+        instructions_ = std::move(rewritten);
+        rebuildLabels();
+        return true;
+    }
+
+    void rebuildLabels() {
+        labels_.clear();
+        for (std::size_t index = 0; index < instructions_.size(); ++index) {
+            const IrInstruction& instruction = instructions_[index];
+            if (instruction.kind == IrInstruction::Kind::Label &&
+                !labels_.emplace(instruction.label, index).second) {
+                throw std::logic_error("重复的内部标签: " + instruction.label);
+            }
+        }
+    }
+
+    static std::vector<IrInstruction::OperandRole> operandRoles(const std::string& opcode,
+                                                                 std::size_t count) {
+        using Role = IrInstruction::OperandRole;
+        std::vector<Role> roles(count, Role::Value);
+        if (opcode == "set" || opcode == "read" || opcode == "getlink" || opcode == "packcolor" ||
+            opcode == "sensor") {
+            if (!roles.empty()) roles[0] = Role::Definition;
+        } else if (opcode == "op") {
+            if (!roles.empty()) roles[0] = Role::Metadata;
+            if (roles.size() > 1) roles[1] = Role::Definition;
+        } else if (opcode == "jump") {
+            if (!roles.empty()) roles[0] = Role::Label;
+            if (roles.size() > 1) roles[1] = Role::Metadata;
+        } else if (opcode == "draw") {
+            if (!roles.empty()) roles[0] = Role::Metadata;
+        } else if (opcode == "unpackcolor") {
+            for (std::size_t index = 0; index < std::min<std::size_t>(4, roles.size()); ++index) {
+                roles[index] = Role::Definition;
+            }
+        }
+        return roles;
+    }
+
+    std::vector<IrInstruction> instructions_;
     std::unordered_map<std::string, std::size_t> labels_;
 };
 
@@ -1060,12 +1588,15 @@ struct ExpressionResult {
     std::string operand;
     bool lvalue = false;
     std::vector<std::string> components;
+    struct MemoryLocation { std::string handle; std::string address; };
+    std::optional<MemoryLocation> memoryLocation;
 
     ExpressionResult() = default;
     ExpressionResult(Type typeValue, std::string operandValue, bool lvalueValue,
-                     std::vector<std::string> componentValues = {})
+                     std::vector<std::string> componentValues = {},
+                     std::optional<MemoryLocation> locationValue = std::nullopt)
         : type(std::move(typeValue)), operand(std::move(operandValue)), lvalue(lvalueValue),
-          components(std::move(componentValues)) {}
+          components(std::move(componentValues)), memoryLocation(std::move(locationValue)) {}
 };
 
 class Generator {
@@ -1086,9 +1617,13 @@ public:
         emitter_.emit("jump", {reference(mainEntryLabel_), "always", "0", "0"});
 
         for (const FunctionDecl& function : program_.functions) {
-            if (function.name != "main_loop") generateFunction(function);
+            if (function.name != "main_loop" && reachableFunctions_.contains(function.name)) {
+                generateFunction(function);
+            }
         }
         generateMainLoop();
+        emitter_.optimizeLocalAssignments();
+        emitter_.optimizeInlining(inlineOrder_);
         return emitter_.finish();
     }
 
@@ -1136,8 +1671,11 @@ private:
             case TypeKind::String: return "\"\"";
             case TypeKind::Message:
             case TypeKind::Building:
-            case TypeKind::Display: return "null";
+            case TypeKind::Display:
+            case TypeKind::Memory: return "null";
             case TypeKind::PackedColor: return "0";
+            case TypeKind::Arr:
+            case TypeKind::Arr2d: return "null";
             case TypeKind::Void: break;
         }
         return "null";
@@ -1166,9 +1704,64 @@ private:
             states[type.structName] = State::Complete;
         };
         for (const StructDecl& declaration : program_.structs) validate(Type(declaration.name), declaration.location);
+        std::function<bool(const Type&, std::unordered_set<std::string>&)> storable =
+            [&](const Type& type, std::unordered_set<std::string>& visiting) {
+                if (type.isArray() || type == TypeKind::Memory || type == TypeKind::String ||
+                    type == TypeKind::Message || type == TypeKind::Building || type == TypeKind::Display ||
+                    type == TypeKind::Void) return false;
+                if (!type.isStruct()) return true;
+                if (!visiting.insert(type.structName).second) return true;
+                for (const StructField& field : structs_.at(type.structName)->fields) {
+                    if (!storable(field.type, visiting)) return false;
+                }
+                visiting.erase(type.structName);
+                return true;
+            };
+        const auto validateArray = [&](const Type& type, SourceLocation location) {
+            if (!type.isArray()) return;
+            std::unordered_set<std::string> visiting;
+            if (!storable(*type.elementType, visiting)) {
+                fail(location, "数组元素类型不能存储在 memory 中: " + typeName(*type.elementType));
+            }
+        };
+        std::function<void(const Expr*)> validateExpression = [&](const Expr* expression) {
+            if (expression == nullptr) return;
+            if (expression->kind == Expr::Kind::TypedInitializer ||
+                (expression->kind == Expr::Kind::Sizeof && !expression->left)) {
+                validateArray(expression->declaredType, expression->location);
+            }
+            validateExpression(expression->left.get());
+            validateExpression(expression->right.get());
+            for (const auto& argument : expression->arguments) validateExpression(argument.get());
+        };
+        std::function<void(const Stmt*)> validateStatement = [&](const Stmt* statement) {
+            if (statement == nullptr) return;
+            if (statement->kind == Stmt::Kind::Variable) validateArray(statement->type, statement->location);
+            validateExpression(statement->expression.get());
+            validateExpression(statement->condition.get());
+            validateExpression(statement->increment.get());
+            validateStatement(statement->initializerStatement.get());
+            validateStatement(statement->thenBranch.get());
+            validateStatement(statement->elseBranch.get());
+            for (const auto& child : statement->statements) validateStatement(child.get());
+        };
+        for (const StructDecl& declaration : program_.structs) {
+            for (const StructField& field : declaration.fields) validateArray(field.type, field.location);
+        }
+        for (const GlobalDecl& global : program_.globals) {
+            validateArray(global.type, global.location);
+            validateExpression(global.initializer.get());
+        }
+        for (const FunctionDecl& function : program_.functions) {
+            validateArray(function.returnType, function.location);
+            for (const Parameter& parameter : function.parameters) validateArray(parameter.type, parameter.location);
+            validateStatement(function.body.get());
+        }
     }
 
     [[nodiscard]] std::size_t typeSize(const Type& type) const {
+        if (type == TypeKind::Arr) return 2;
+        if (type == TypeKind::Arr2d) return 3;
         if (!type.isStruct()) return type == TypeKind::Void ? 0 : 1;
         std::size_t size = 0;
         for (const StructField& field : structs_.at(type.structName)->fields) size += typeSize(field.type);
@@ -1176,6 +1769,17 @@ private:
     }
 
     void appendStorage(const Type& type, const std::string& base, std::vector<std::string>& result) const {
+        if (type == TypeKind::Arr) {
+            result.push_back(base + "_handle");
+            result.push_back(base + "_offset");
+            return;
+        }
+        if (type == TypeKind::Arr2d) {
+            result.push_back(base + "_handle");
+            result.push_back(base + "_offset");
+            result.push_back(base + "_stride");
+            return;
+        }
         if (!type.isStruct()) {
             result.push_back(base);
             return;
@@ -1192,11 +1796,11 @@ private:
     }
 
     [[nodiscard]] std::vector<std::string> operandsOf(const ExpressionResult& value) const {
-        return value.type.isStruct() ? value.components : std::vector<std::string>{value.operand};
+        return value.type.isRuntimeAggregate() ? value.components : std::vector<std::string>{value.operand};
     }
 
     [[nodiscard]] std::vector<std::string> operandsOf(const Symbol& symbol) const {
-        return symbol.type.isStruct() ? symbol.components : std::vector<std::string>{symbol.storage};
+        return symbol.type.isRuntimeAggregate() ? symbol.components : std::vector<std::string>{symbol.storage};
     }
 
     void collectDeclarations() {
@@ -1251,9 +1855,12 @@ private:
     static void collectCalls(const Expr* expression, std::vector<std::pair<std::string, SourceLocation>>& calls) {
         if (expression == nullptr) return;
         if (expression->kind == Expr::Kind::Sizeof) return;
-        if (expression->kind == Expr::Kind::Call) calls.emplace_back(expression->text, expression->location);
+        if (expression->kind == Expr::Kind::Call && !expression->receiver) {
+            calls.emplace_back(expression->text, expression->location);
+        }
         collectCalls(expression->left.get(), calls);
         collectCalls(expression->right.get(), calls);
+        collectCalls(expression->receiver.get(), calls);
         for (const auto& argument : expression->arguments) collectCalls(argument.get(), calls);
     }
 
@@ -1270,6 +1877,7 @@ private:
 
     void validateCallGraph() {
         std::unordered_map<std::string, std::vector<std::string>> graph;
+        std::vector<std::string> initializationRoots;
         for (const FunctionDecl& function : program_.functions) {
             std::vector<std::pair<std::string, SourceLocation>> calls;
             collectCalls(function.body.get(), calls);
@@ -1280,11 +1888,22 @@ private:
                 graph[function.name].push_back(callee);
             }
         }
+        for (const GlobalDecl& global : program_.globals) {
+            std::vector<std::pair<std::string, SourceLocation>> calls;
+            collectCalls(global.initializer.get(), calls);
+            for (const auto& [callee, location] : calls) {
+                if (isBuiltinFunction(callee)) continue;
+                if (functions_.find(callee) == functions_.end()) fail(location, "未定义的函数: " + callee);
+                if (callee == "main_loop") fail(location, "不能显式调用 main_loop");
+                initializationRoots.push_back(callee);
+            }
+        }
 
         enum class VisitState { Visiting, Complete };
         std::unordered_map<std::string, VisitState> states;
         std::vector<std::string> stack;
         std::function<void(const std::string&)> visit = [&](const std::string& name) {
+            reachableFunctions_.insert(name);
             const auto state = states.find(name);
             if (state != states.end()) {
                 if (state->second == VisitState::Complete) return;
@@ -1303,15 +1922,17 @@ private:
             for (const std::string& callee : graph[name]) visit(callee);
             stack.pop_back();
             states[name] = VisitState::Complete;
+            if (name != "main_loop") inlineOrder_.push_back(name);
         };
 
-        for (const FunctionDecl& function : program_.functions) visit(function.name);
+        visit("main_loop");
+        for (const std::string& root : initializationRoots) visit(root);
     }
 
     void declareGlobals() {
         for (const GlobalDecl& global : program_.globals) {
             const std::string storage = global.external ? global.name : "__global_" + global.name;
-            if (global.external && global.type.isStruct()) fail(global.location, "extern 结构体变量暂不支持");
+            if (global.external && global.type.isRuntimeAggregate()) fail(global.location, "extern 结构体或数组变量暂不支持");
             scopes_.front().emplace(global.name, makeSymbol(global.type, storage, !global.external));
         }
     }
@@ -1412,7 +2033,7 @@ private:
     }
 
     [[nodiscard]] Symbol makeSymbol(const Type& type, const std::string& base, bool assignable) const {
-        if (type.isStruct()) return {type, "", assignable, storageFor(type, base)};
+        if (type.isRuntimeAggregate()) return {type, "", assignable, storageFor(type, base)};
         return {type, base, assignable, {}};
     }
 
@@ -1421,7 +2042,12 @@ private:
     }
 
     [[nodiscard]] ExpressionResult defaultResult(const Type& type) const {
-        if (!type.isStruct()) return {type, defaultValue(type), false, {}};
+        if (!type.isRuntimeAggregate()) return {type, defaultValue(type), false, {}};
+        if (type.isArray()) {
+            std::vector<std::string> values;
+            for (std::size_t index = 0; index < typeSize(type); ++index) values.push_back("null");
+            return {type, "", false, std::move(values)};
+        }
         std::vector<std::string> components;
         for (const StructField& field : structs_.at(type.structName)->fields) {
             const ExpressionResult fieldDefault = defaultResult(field.type);
@@ -1440,7 +2066,7 @@ private:
             emitter_.emit("set", {temporaryStorage, operand});
             saved.push_back(temporaryStorage);
         }
-        if (value.type.isStruct()) return {value.type, "", false, std::move(saved)};
+        if (value.type.isRuntimeAggregate()) return {value.type, "", false, std::move(saved)};
         return {value.type, saved.front(), false, {}};
     }
 
@@ -1453,6 +2079,72 @@ private:
         }
     }
 
+    [[nodiscard]] std::string addressAdd(const std::string& base, const std::string& delta) {
+        if (delta == "0") return base;
+        const std::string result = temporary();
+        emitter_.emit("op", {"add", result, base, delta});
+        return result;
+    }
+
+    [[nodiscard]] std::string indexedAddress(const std::string& base, const std::string& index,
+                                              std::size_t elementSize) {
+        if (elementSize == 1) return addressAdd(base, index);
+        const std::string scaled = temporary();
+        emitter_.emit("op", {"mul", scaled, index, std::to_string(elementSize)});
+        return addressAdd(base, scaled);
+    }
+
+    ExpressionResult generateIndex(const Expr& expression) {
+        const ExpressionResult object = generateExpression(*expression.left);
+        const ExpressionResult index = generateExpression(*expression.right);
+        if (index.type != TypeKind::Int) fail(expression.location, "数组索引必须是 int");
+        if (object.type == TypeKind::Memory) {
+            const std::string address = index.operand;
+            const std::string result = temporary();
+            emitter_.emit("read", {result, object.operand, address});
+            return {TypeKind::Number, result, true, {}, ExpressionResult::MemoryLocation{object.operand, address}};
+        }
+        if (object.type != TypeKind::Arr && object.type != TypeKind::Arr2d) {
+            fail(expression.location, "索引左侧必须是 memory、arr<T> 或 arr2d<T>");
+        }
+        const std::string handle = object.components.front();
+        std::string address;
+        Type elementType;
+        if (object.type == TypeKind::Arr) {
+            address = indexedAddress(object.components[1], index.operand, typeSize(*object.type.elementType));
+            elementType = *object.type.elementType;
+        } else {
+            const std::string rowOffset = temporary();
+            emitter_.emit("op", {"mul", rowOffset, index.operand, object.components[2]});
+            address = addressAdd(object.components[1], rowOffset);
+            elementType = Type(TypeKind::Arr, *object.type.elementType);
+        }
+        if (elementType.isArray()) {
+            return {elementType, "", false, {handle, address}, std::nullopt};
+        }
+        const std::size_t size = typeSize(elementType);
+        std::vector<std::string> values;
+        for (std::size_t offset = 0; offset < size; ++offset) {
+            const std::string elementAddress = addressAdd(address, std::to_string(offset));
+            const std::string result = temporary();
+            emitter_.emit("read", {result, handle, elementAddress});
+            values.push_back(result);
+        }
+        if (elementType.isRuntimeAggregate()) {
+            return {elementType, "", true, std::move(values), ExpressionResult::MemoryLocation{handle, address}};
+        }
+        return {elementType, values.front(), true, {}, ExpressionResult::MemoryLocation{handle, address}};
+    }
+
+    void storeMemory(const ExpressionResult& destination, const ExpressionResult& source) {
+        if (!destination.memoryLocation) fail(SourceLocation{}, "内部错误：缺少内存位置");
+        const auto& location = *destination.memoryLocation;
+        const std::vector<std::string> values = operandsOf(source);
+        for (std::size_t offset = 0; offset < values.size(); ++offset) {
+            emitter_.emit("write", {values[offset], location.handle, addressAdd(location.address, std::to_string(offset))});
+        }
+    }
+
     ExpressionResult generateValue(const Expr& expression, const Type& expected) {
         if (expression.kind == Expr::Kind::InitializerList) return generateInitializer(expression, expected);
         ExpressionResult value = generateExpression(expression);
@@ -1461,6 +2153,20 @@ private:
     }
 
     ExpressionResult generateInitializer(const Expr& expression, const Type& expected) {
+        if (expected.isArray()) {
+            const std::size_t count = expected.kind == TypeKind::Arr ? 2 : 3;
+            if (expression.arguments.size() > count) fail(expression.location, typeName(expected) + " 初始化项过多");
+            std::vector<std::string> components;
+            for (std::size_t index = 0; index < count; ++index) {
+                Type componentType = index == 0 ? TypeKind::Memory : TypeKind::Int;
+                ExpressionResult value = index < expression.arguments.size()
+                    ? generateValue(*expression.arguments[index], componentType)
+                    : defaultResult(componentType);
+                value = materialize(value);
+                components.push_back(value.operand);
+            }
+            return {expected, "", false, std::move(components)};
+        }
         if (!expected.isStruct()) {
             if (expression.arguments.size() > 1) fail(expression.location, "标量初始化列表最多包含一个元素");
             if (expression.arguments.empty()) return defaultResult(expected);
@@ -1607,7 +2313,7 @@ private:
         } else {
             if (!statement.expression) fail(statement.location, "非 void 函数必须返回值");
             const ExpressionResult value = materialize(generateValue(*statement.expression, currentFunction_->returnType));
-            const Symbol result = currentFunction_->returnType.isStruct()
+            const Symbol result = currentFunction_->returnType.isRuntimeAggregate()
                 ? Symbol{currentFunction_->returnType, "", true, info.resultStorage}
                 : Symbol{currentFunction_->returnType, info.resultStorage.front(), true, {}};
             assignValue(result, value);
@@ -1648,6 +2354,8 @@ private:
                 return generateIncrement(expression, false);
             case Expr::Kind::Member:
                 return generateMember(expression);
+            case Expr::Kind::Index:
+                return generateIndex(expression);
             case Expr::Kind::InitializerList:
                 fail(expression.location, "初始化列表需要明确的目标类型");
             case Expr::Kind::TypedInitializer:
@@ -1669,6 +2377,14 @@ private:
             return;
         }
         if (!expected.isStruct()) {
+            if (expected.isArray()) {
+                const std::size_t count = expected.kind == TypeKind::Arr ? 2 : 3;
+                if (expression.arguments.size() > count) fail(expression.location, typeName(expected) + " 初始化项过多");
+                for (std::size_t index = 0; index < expression.arguments.size(); ++index) {
+                    validateInitializerType(*expression.arguments[index], index == 0 ? Type(TypeKind::Memory) : Type(TypeKind::Int));
+                }
+                return;
+            }
             if (expression.arguments.size() > 1) fail(expression.location, "标量初始化列表最多包含一个元素");
             if (!expression.arguments.empty()) validateInitializerType(*expression.arguments.front(), expected);
             return;
@@ -1831,7 +2547,39 @@ private:
                 }
                 fail(expression.location, "结构体 " + objectType.structName + " 没有字段 " + expression.text);
             }
+            case Expr::Kind::Index: {
+                const Type objectType = expressionType(*expression.left);
+                const Type indexType = expressionType(*expression.right);
+                if (indexType != TypeKind::Int) fail(expression.location, "数组索引必须是 int");
+                if (objectType == TypeKind::Memory) return TypeKind::Number;
+                if (objectType == TypeKind::Arr) return *objectType.elementType;
+                if (objectType == TypeKind::Arr2d) return Type(TypeKind::Arr, *objectType.elementType);
+                fail(expression.location, "索引左侧必须是 memory、arr<T> 或 arr2d<T>");
+            }
             case Expr::Kind::Call: {
+                if (expression.receiver) {
+                    const Type receiverType = expressionType(*expression.receiver);
+                    if (receiverType != TypeKind::Building) {
+                        fail(expression.location, "内置成员函数的接收者必须是 building");
+                    }
+                    if (expression.text == "enable") {
+                        if (expression.arguments.size() != 1) {
+                            fail(expression.location, "enable 需要一个参数");
+                        }
+                        const Type argument = expressionType(*expression.arguments.front());
+                        if (argument != TypeKind::Bool && !isNumeric(argument)) {
+                            fail(expression.location, "enable 参数必须是 bool 或数值类型");
+                        }
+                        return TypeKind::Void;
+                    }
+                    if (expression.text == "get_enabled") {
+                        if (!expression.arguments.empty()) {
+                            fail(expression.location, "get_enabled 不需要参数");
+                        }
+                        return TypeKind::Bool;
+                    }
+                    fail(expression.location, "未知的内置成员函数: " + expression.text);
+                }
                 if (builtinOpFunction(expression.text)) return builtinOpType(expression);
                 if (expression.text == "rgb" || expression.text == "rgba") {
                     const std::size_t expected = expression.text == "rgb" ? 3 : 4;
@@ -1921,8 +2669,10 @@ private:
                 const std::vector<std::string> objectOperands = operandsOf(object);
                 std::vector<std::string> fieldOperands(objectOperands.begin() + static_cast<std::ptrdiff_t>(offset),
                                                        objectOperands.begin() + static_cast<std::ptrdiff_t>(offset + fieldSize));
-                if (field.type.isStruct()) return {field.type, "", object.lvalue, std::move(fieldOperands)};
-                return {field.type, fieldOperands.front(), object.lvalue, {}};
+                std::optional<ExpressionResult::MemoryLocation> location = object.memoryLocation;
+                if (location) location->address = addressAdd(location->address, std::to_string(offset));
+                if (field.type.isRuntimeAggregate()) return {field.type, "", object.lvalue, std::move(fieldOperands), location};
+                return {field.type, fieldOperands.front(), object.lvalue, {}, location};
             }
             offset += fieldSize;
         }
@@ -2082,7 +2832,12 @@ private:
 
         if (expression.text == "=") {
             ExpressionResult source = generateValue(*expression.right, destination.type);
-            if (destination.type.isStruct() || expression.right->kind == Expr::Kind::InitializerList) {
+            if (destination.memoryLocation) {
+                source = materialize(source);
+                storeMemory(destination, source);
+                return {destination.type, destination.operand, false, destination.components};
+            }
+            if (destination.type.isRuntimeAggregate() || expression.right->kind == Expr::Kind::InitializerList) {
                 source = materialize(source);
             }
             const Symbol target{destination.type, destination.operand, true, destination.components};
@@ -2091,6 +2846,20 @@ private:
         }
 
         const ExpressionResult source = generateExpression(*expression.right);
+        if (destination.memoryLocation) {
+            if (!isNumeric(destination.type) || !isNumeric(source.type)) {
+                fail(expression.location, "内存元素的复合赋值需要数值操作数");
+            }
+            const std::unordered_map<std::string, std::string> operations = {
+                {"+=", "add"}, {"-=", "sub"}, {"*=", "mul"}, {"/=", "div"}, {"%=", "mod"},
+            };
+            const auto operation = operations.find(expression.text);
+            if (operation == operations.end()) fail(expression.location, "未知复合赋值运算符");
+            const std::string result = temporary();
+            emitter_.emit("op", {operation->second, result, destination.operand, source.operand});
+            emitter_.emit("write", {result, destination.memoryLocation->handle, destination.memoryLocation->address});
+            return {destination.type, result, false};
+        }
         if (destination.type.isStruct()) {
             const Type point("point"), vector("vec");
             std::string operation;
@@ -2144,10 +2913,14 @@ private:
         }
         emitter_.emit("op", {expression.text == "++" ? "add" : "sub",
                              target.operand, target.operand, "1"});
+        if (target.memoryLocation) {
+            emitter_.emit("write", {target.operand, target.memoryLocation->handle, target.memoryLocation->address});
+        }
         return {target.type, result, false};
     }
 
     ExpressionResult generateCall(const Expr& expression) {
+        if (expression.receiver) return generateBuiltinMemberCall(expression);
         if (builtinOpFunction(expression.text)) return generateBuiltinOp(expression);
         if (expression.text == "print") return generatePrint(expression);
         if (expression.text == "printchar" || expression.text == "putchar") return generatePrintChar(expression);
@@ -2207,8 +2980,33 @@ private:
             emitter_.emit("set", {result, resultStorage});
             results.push_back(result);
         }
-        if (function.returnType.isStruct()) return {function.returnType, "", false, std::move(results)};
+        if (function.returnType.isRuntimeAggregate()) return {function.returnType, "", false, std::move(results)};
         return {function.returnType, results.front(), false, {}};
+    }
+
+    ExpressionResult generateBuiltinMemberCall(const Expr& expression) {
+        const ExpressionResult receiver = generateExpression(*expression.receiver);
+        if (receiver.type != TypeKind::Building) {
+            fail(expression.location, "内置成员函数的接收者必须是 building");
+        }
+        if (expression.text == "enable") {
+            if (expression.arguments.size() != 1) {
+                fail(expression.location, "enable 需要一个参数");
+            }
+            const ExpressionResult value = toBoolean(generateExpression(*expression.arguments.front()),
+                                                     expression.arguments.front()->location);
+            emitter_.emit("control", {"enabled", receiver.operand, value.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "get_enabled") {
+            if (!expression.arguments.empty()) {
+                fail(expression.location, "get_enabled 不需要参数");
+            }
+            const std::string result = temporary();
+            emitter_.emit("sensor", {result, receiver.operand, "@enabled"});
+            return {TypeKind::Bool, result, false};
+        }
+        fail(expression.location, "未知的内置成员函数: " + expression.text);
     }
 
     ExpressionResult generateBuiltinOp(const Expr& expression) {
@@ -2381,8 +3179,73 @@ private:
         return {Type("color"), "", false, std::move(components)};
     }
 
+    std::optional<long long> constantInteger(const Expr& expression) const {
+        if (expression.kind == Expr::Kind::Number &&
+            expression.text.find_first_of(".eE") == std::string::npos) {
+            long long value = 0;
+            const auto [end, error] = std::from_chars(expression.text.data(),
+                                                       expression.text.data() + expression.text.size(), value);
+            if (error == std::errc{} && end == expression.text.data() + expression.text.size()) return value;
+            return std::nullopt;
+        }
+        if (expression.kind == Expr::Kind::Unary && expression.right != nullptr &&
+            (expression.text == "+" || expression.text == "-")) {
+            const std::optional<long long> value = constantInteger(*expression.right);
+            if (!value) return std::nullopt;
+            if (expression.text == "+") return value;
+            if (*value == std::numeric_limits<long long>::min()) return std::nullopt;
+            return -*value;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<std::array<int, 4>> constantColor(const Expr& expression) const {
+        std::array<int, 4> result = {0, 0, 0, 0};
+        const std::vector<std::unique_ptr<Expr>>* components = nullptr;
+        if (expression.kind == Expr::Kind::TypedInitializer && expression.declaredType == Type("color")) {
+            components = &expression.arguments;
+        } else if (expression.kind == Expr::Kind::Call &&
+                   (expression.text == "rgb" || expression.text == "rgba")) {
+            components = &expression.arguments;
+            if (expression.text == "rgb") result[3] = 255;
+        } else {
+            return std::nullopt;
+        }
+        if (components->size() > result.size()) return std::nullopt;
+        for (std::size_t index = 0; index < components->size(); ++index) {
+            const std::optional<long long> value = constantInteger(*components->at(index));
+            if (!value) return std::nullopt;
+            result[index] = static_cast<int>(std::clamp(*value, 0LL, 255LL));
+        }
+        return result;
+    }
+
+    std::optional<std::string> constantPackedColor(const Expr& expression) const {
+        std::array<int, 4> components = {0, 0, 0, 255};
+        if (expression.arguments.size() == 1) {
+            const std::optional<std::array<int, 4>> color = constantColor(*expression.arguments.front());
+            if (!color) return std::nullopt;
+            components = *color;
+        } else if (expression.arguments.size() == 3 || expression.arguments.size() == 4) {
+            for (std::size_t index = 0; index < expression.arguments.size(); ++index) {
+                const std::optional<long long> value = constantInteger(*expression.arguments[index]);
+                if (!value) return std::nullopt;
+                components[index] = static_cast<int>(std::clamp(*value, 0LL, 255LL));
+            }
+        } else {
+            return std::nullopt;
+        }
+        std::ostringstream literal;
+        literal << '%' << std::hex << std::setfill('0');
+        for (const int component : components) literal << std::setw(2) << component;
+        return literal.str();
+    }
+
     ExpressionResult generateColorConversion(const Expr& expression) {
         if (expression.text == "pack_color") {
+            if (const std::optional<std::string> literal = constantPackedColor(expression)) {
+                return {TypeKind::PackedColor, *literal, false};
+            }
             std::vector<std::string> components;
             if (expression.arguments.size() == 1) {
                 const ExpressionResult value = generateExpression(*expression.arguments[0]);
@@ -2671,9 +3534,11 @@ private:
 
     const Program& program_;
     [[maybe_unused]] CompileOptions options_;
-    Emitter emitter_;
+    IrBuilder emitter_;
     std::unordered_map<std::string, const StructDecl*> structs_;
     std::unordered_map<std::string, FunctionInfo> functions_;
+    std::unordered_set<std::string> reachableFunctions_;
+    std::vector<std::string> inlineOrder_;
     std::vector<std::unordered_map<std::string, Symbol>> scopes_;
     const FunctionDecl* currentFunction_ = nullptr;
     std::string currentContext_ = "global";

@@ -138,6 +138,7 @@ void drawflush(display target);
 - `draw_scale` 确实接受小数，建议使用 `number`。
 - `color` 保存四个可访问的 `int r/g/b/a` 分量；`packed_color` 是特殊位模式的单槽值。`pack_color`/`unpack_color` 通过游戏的 `packcolor`/`unpackcolor` 转换，`draw_col` 只接受 `packed_color`。
 - `pack_color` 接受一个 `color`，也接受 RGB 三个 `int` 或 RGBA 四个 `int`；三参数形式的 alpha 默认为 255。
+- `pack_color` 的分量全部可在编译期确定时，编译器直接生成 Mindustry 原生 `%RRGGBBAA` 字面量；含运行期值时仍生成 `packcolor` 指令。
 - `draw_image` 的参数是“内容对象或逻辑显示器”的联合约束，不应误标为普通 `building`。如果暂时不引入通用联合类型，可把 `image_source` 做成仅供内置函数类型检查使用的“能力类型”，允许各种 `UnlockableContent` 常量和 `display` 隐式转入。
 - `drawflush` 应要求专用 `display` 类型，不应接收任意 `building`。与 `printflush` 一样，可允许整型字面量 `1` 作为 `display1` 的编译期简写，但不应接收字符串。
 - 对齐参数初期可接受 `int` 和预定义的 `@bottomLeft` 等常量；长期建议提供一个封闭 `draw_align` 枚举，避免任意整数误用。

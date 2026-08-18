@@ -240,7 +240,18 @@
 
 ## 7. 对高级语言内置 API 的建议
 
-### 7.1 第一阶段统一使用自由函数
+### 7.1 内置接口形式
+
+普通感知、内存和控制接口仍优先使用自由函数；对于高频且语义明确的建筑开关操作，编译器额外支持成员函数语法：
+
+```cpp
+bool active = switch1.get_enabled();
+switch1.enable(false);
+```
+
+它们分别降低为 `sensor result switch1 @enabled` 和 `control enabled switch1 false`。这不是通用类/对象方法机制，只对编译器内置的 `building` 接收者和已登记的方法名生效。
+
+### 7.2 第一阶段统一使用自由函数
 
 常用全局动作保持短名称更适合游戏脚本，例如：
 
@@ -276,14 +287,14 @@ drawflush(display);
 
 这种设计只需要自由函数重载或不同名称，不引入隐含接收者、引用参数、特殊成员函数、对象布局或虚派发。
 
-### 7.2 可空与动态有效性
+### 7.3 可空与动态有效性
 
 - lookup、radar、getlink、getblock、fetch object、spawn、bullet 等应返回 `T?`；
 - `valid()` 检查当前实体状态，不应等价于“静态非空”；游戏世界可在后续指令中变化；
 - 对 `ulocate` 等多输出指令，建议返回结构：`{ bool found; number x; number y; building? building; }`，包装前先初始化全部字段；
 - 对底层动态 `sensor` 保留 raw 入口，但正常代码使用按第一个参数类型重载的自由函数，避免任意 `raw` 扩散。
 
-### 7.3 副作用分类
+### 7.4 副作用分类
 
 IR 至少应区分：
 

@@ -1,0 +1,287 @@
+arr<int> board = {cell1, 0};
+arr<packed_color> tile_backgrounds = {cell2, 0};
+arr<packed_color> tile_foregrounds = {cell2, 13};
+bool initialized = false;
+
+int line_count = 0;
+int line0 = 0;
+int line1 = 0;
+int line2 = 0;
+int line3 = 0;
+bool line_merged = false;
+bool move_changed = false;
+
+void append_line_value(int value)
+{
+    if (value == 0) {
+        return;
+    }
+    if (line_count == 0) {
+        line0 = value;
+        line_count = 1;
+        line_merged = false;
+    } else if (line_count == 1 && line0 == value && !line_merged) {
+        line0 += 1;
+        board[16] += shl(1, line0);
+        line_merged = true;
+    } else if (line_count == 1) {
+        line1 = value;
+        line_count = 2;
+        line_merged = false;
+    } else if (line_count == 2 && line1 == value && !line_merged) {
+        line1 += 1;
+        board[16] += shl(1, line1);
+        line_merged = true;
+    } else if (line_count == 2) {
+        line2 = value;
+        line_count = 3;
+        line_merged = false;
+    } else if (line_count == 3 && line2 == value && !line_merged) {
+        line2 += 1;
+        board[16] += shl(1, line2);
+        line_merged = true;
+    } else if (line_count == 3) {
+        line3 = value;
+        line_count = 4;
+        line_merged = false;
+    }
+}
+
+void move_line(int first, int second, int third, int fourth)
+{
+    int old0 = board[first];
+    int old1 = board[second];
+    int old2 = board[third];
+    int old3 = board[fourth];
+
+    line0 = 0;
+    line1 = 0;
+    line2 = 0;
+    line3 = 0;
+    line_count = 0;
+    line_merged = false;
+    append_line_value(old0);
+    append_line_value(old1);
+    append_line_value(old2);
+    append_line_value(old3);
+
+    if (board[first] != line0) {
+        board[first] = line0;
+        move_changed = true;
+    }
+    if (board[second] != line1) {
+        board[second] = line1;
+        move_changed = true;
+    }
+    if (board[third] != line2) {
+        board[third] = line2;
+        move_changed = true;
+    }
+    if (board[fourth] != line3) {
+        board[fourth] = line3;
+        move_changed = true;
+    }
+}
+
+void move_left()
+{
+    move_line(0, 1, 2, 3);
+    move_line(4, 5, 6, 7);
+    move_line(8, 9, 10, 11);
+    move_line(12, 13, 14, 15);
+}
+
+void move_right()
+{
+    move_line(3, 2, 1, 0);
+    move_line(7, 6, 5, 4);
+    move_line(11, 10, 9, 8);
+    move_line(15, 14, 13, 12);
+}
+
+void move_up()
+{
+    move_line(0, 4, 8, 12);
+    move_line(1, 5, 9, 13);
+    move_line(2, 6, 10, 14);
+    move_line(3, 7, 11, 15);
+}
+
+void move_down()
+{
+    move_line(12, 8, 4, 0);
+    move_line(13, 9, 5, 1);
+    move_line(14, 10, 6, 2);
+    move_line(15, 11, 7, 3);
+}
+
+void spawn_tile()
+{
+    int start = floor(rand(16));
+    int tile = 1;
+    if (floor(rand(10)) == 0) {
+        tile = 2;
+    }
+    for (int offset = 0; offset < 16; offset++) {
+        int index = (start + offset) % 16;
+        if (board[index] == 0) {
+            board[index] = tile;
+            return;
+        }
+    }
+}
+
+void reset_game()
+{
+    for (int index = 0; index < 16; index++) {
+        board[index] = 0;
+    }
+    board[16] = 0;
+    board[17] = 0;
+    spawn_tile();
+    spawn_tile();
+}
+
+bool can_move()
+{
+    for (int index = 0; index < 16; index++) {
+        if (board[index] == 0) {
+            return true;
+        }
+    }
+    for (int row = 0; row < 4; row++) {
+        for (int column = 0; column < 4; column++) {
+            int index = row * 4 + column;
+            if (column < 3 && board[index] == board[index + 1]) {
+                return true;
+            }
+            if (row < 3 && board[index] == board[index + 4]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void initialize_styles()
+{
+    tile_backgrounds[0] = pack_color(205, 193, 180);
+    tile_backgrounds[1] = pack_color(238, 228, 218);
+    tile_backgrounds[2] = pack_color(237, 224, 200);
+    tile_backgrounds[3] = pack_color(242, 177, 121);
+    tile_backgrounds[4] = pack_color(245, 149, 99);
+    tile_backgrounds[5] = pack_color(246, 124, 95);
+    tile_backgrounds[6] = pack_color(246, 94, 59);
+    tile_backgrounds[7] = pack_color(237, 207, 114);
+    tile_backgrounds[8] = pack_color(237, 204, 97);
+    tile_backgrounds[9] = pack_color(237, 200, 80);
+    tile_backgrounds[10] = pack_color(237, 197, 63);
+    tile_backgrounds[11] = pack_color(237, 194, 46);
+    tile_backgrounds[12] = pack_color(60, 58, 50);
+    tile_foregrounds[0] = pack_color(119, 110, 101);
+    tile_foregrounds[1] = pack_color(249, 246, 242);
+}
+
+void set_tile_style(int value)
+{
+    int style = min(value, 12);
+    int foreground_style = min(idiv(value, 3), 1);
+    packed_color background = tile_backgrounds[style];
+    packed_color foreground = tile_foregrounds[foreground_style];
+    draw_reset();
+    set_packed_color(background);
+    draw_rect(0, 0, 80, 80);
+    set_packed_color(foreground);
+}
+
+void render_cell(display target, int value)
+{
+    set_tile_style(value);
+    if (value != 0) {
+        print(shl(1, value));
+        draw_reset();
+        draw_scale(3, 3);
+        draw_print(point{13, 13}, 1);
+        draw_reset();
+    }
+    drawflush(target);
+}
+
+void render_score(display target)
+{
+    draw_clear(10, 10, 10);
+    draw_color(249, 246, 242, 255);
+    print("SCORE ");
+    print(board[16]);
+    if (board[17] != 0) {
+        print("\nGAME OVER");
+    }
+    draw_reset();
+    draw_scale(2, 2);
+    draw_print(point{44, 44}, 1);
+    draw_reset();
+    drawflush(target);
+}
+
+void render()
+{
+    render_cell(display1, board[0]);
+    render_cell(display2, board[1]);
+    render_cell(display3, board[2]);
+    render_cell(display4, board[3]);
+    render_cell(display5, board[4]);
+    render_cell(display6, board[5]);
+    render_cell(display7, board[6]);
+    render_cell(display8, board[7]);
+    render_cell(display9, board[8]);
+    render_cell(display10, board[9]);
+    render_cell(display11, board[10]);
+    render_cell(display12, board[11]);
+    render_cell(display13, board[12]);
+    render_cell(display14, board[13]);
+    render_cell(display15, board[14]);
+    render_cell(display16, board[15]);
+    render_score(display17);
+}
+
+void main_loop()
+{
+    if (!initialized) {
+        initialize_styles();
+        reset_game();
+        initialized = true;
+    }
+
+    if (switch1.get_enabled()) {
+        switch1.enable(false);
+        reset_game();
+    }
+
+    if (board[17] == 0) {
+        move_changed = false;
+        if (switch2.get_enabled()) {
+            switch2.enable(false);
+            move_up();
+        }
+        if (switch3.get_enabled()) {
+            switch3.enable(false);
+            move_left();
+        }
+        if (switch4.get_enabled()) {
+            switch4.enable(false);
+            move_right();
+        }
+        if (switch5.get_enabled()) {
+            switch5.enable(false);
+            move_down();
+        }
+        if (move_changed) {
+            spawn_tile();
+        }
+        if (!can_move()) {
+            board[17] = 1;
+        }
+    }
+
+    render();
+}
