@@ -158,3 +158,25 @@ RuntimeObject       // @this, @clientUnit
 ```
 
 后端输出时保留原始 `@name` 形式；只有目标指令明确要求数值、内容类型或 Logic ID 时，才进行相应转换。不要在编译期把 `@copper` 降级为字符串或固定整数。
+
+### 4.1 当前实现状态
+
+mdt_cc 当前已经实现第一阶段的内容常量：
+
+```text
+item       liquid       block       unit_kind       team
+```
+
+编译器根据当前仓库中的 Mindustry 内容注册表为原版 `@` 常量赋予精确类型，常量不可赋值，不同句柄类型之间没有隐式转换。允许同类型 `==`/`!=`，禁止算术和顺序比较。天气、状态效果、传感器、运行时变量、颜色、音效和对齐等其他 `@` 名字仍属于后续阶段，不能误当作内容句柄。
+
+公开 lookup 映射为：
+
+```cpp
+block lookup_block(int logic_id);
+unit_kind lookup_unit(int logic_id);
+item lookup_item(int logic_id);
+liquid lookup_liquid(int logic_id);
+team lookup_team(int logic_id);
+```
+
+它们分别生成 `lookup block/unit/item/liquid/team`。无效 Logic ID 由游戏写入 `null`；Logic ID 与普通内容 ID 不等价。

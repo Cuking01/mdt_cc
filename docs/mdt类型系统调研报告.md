@@ -288,7 +288,7 @@ content
 item
 liquid
 block
-unit_type
+unit_kind
 building?
 unit?
 team
@@ -327,7 +327,7 @@ null -> T?           允许
 object? -> number
 number -> item/block/unit
 building -> block
-unit_type -> unit
+unit_kind -> unit
 string -> number
 ```
 

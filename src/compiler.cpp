@@ -1,4 +1,5 @@
 #include "mdtc/compiler.hpp"
+#include "preprocessor.hpp"
 
 #include <algorithm>
 #include <array>
@@ -38,6 +39,7 @@ struct SourceLocation {
 enum class TokenKind {
     End,
     Identifier,
+    BuiltinConstant,
     NumberLiteral,
     StringLiteral,
     KwVoid,
@@ -49,17 +51,32 @@ enum class TokenKind {
     KwString,
     KwMessage,
     KwBuilding,
+    KwPosc,
+    KwItem,
+    KwLiquid,
+    KwBlock,
+    KwUnit,
+    KwUnitKind,
+    KwTeam,
+    KwSensor,
+    KwSensorValue,
+    KwRadarFilter,
+    KwRadarSort,
     KwDisplay,
     KwMemory,
     KwArr,
     KwArr2d,
     KwColor,
     KwPackedColor,
+    KwRestrict,
     KwStruct,
     KwSizeof,
     KwExtern,
     KwIf,
     KwElse,
+    KwSwitch,
+    KwCase,
+    KwDefault,
     KwWhile,
     KwFor,
     KwBreak,
@@ -67,6 +84,8 @@ enum class TokenKind {
     KwReturn,
     KwTrue,
     KwFalse,
+    KwNull,
+    KwThis,
     LeftParen,
     RightParen,
     LeftBrace,
@@ -96,7 +115,10 @@ enum class TokenKind {
     LessEqual,
     GreaterEqual,
     AndAnd,
+    Ampersand,
     OrOr,
+    Question,
+    Colon,
     Dot,
 };
 
@@ -111,6 +133,7 @@ public:
     explicit Lexer(std::string_view source) : source_(source) {}
 
     std::vector<Token> scan() {
+        if (source_.starts_with("\xEF\xBB\xBF")) position_ = 3;
         std::vector<Token> tokens;
         while (!atEnd()) {
             skipWhitespaceAndComments();
@@ -122,6 +145,11 @@ public:
     }
 
 private:
+    struct CodePoint {
+        char32_t value;
+        std::size_t bytes;
+    };
+
     bool atEnd() const { return position_ >= source_.size(); }
 
     char peek(std::size_t offset = 0) const {
@@ -129,15 +157,58 @@ private:
         return index < source_.size() ? source_[index] : '\0';
     }
 
-    char advance() {
-        const char character = source_[position_++];
-        if (character == '\n') {
+    [[noreturn]] void invalidUtf8() const {
+        throw CompileError(line_, column_, "非法 UTF-8 编码");
+    }
+
+    CodePoint decode(std::size_t position) const {
+        if (position >= source_.size()) return {U'\0', 0};
+        const auto byte = [&](std::size_t offset) {
+            return static_cast<unsigned char>(source_[position + offset]);
+        };
+        const unsigned char first = byte(0);
+        if (first < 0x80) return {first, 1};
+
+        std::size_t length = 0;
+        char32_t value = 0;
+        if (first >= 0xC2 && first <= 0xDF) {
+            length = 2;
+            value = first & 0x1F;
+        } else if (first >= 0xE0 && first <= 0xEF) {
+            length = 3;
+            value = first & 0x0F;
+        } else if (first >= 0xF0 && first <= 0xF4) {
+            length = 4;
+            value = first & 0x07;
+        } else {
+            invalidUtf8();
+        }
+        if (position + length > source_.size()) invalidUtf8();
+        for (std::size_t offset = 1; offset < length; ++offset) {
+            const unsigned char continuation = byte(offset);
+            if ((continuation & 0xC0) != 0x80) invalidUtf8();
+            value = (value << 6) | (continuation & 0x3F);
+        }
+        if ((length == 3 && value < 0x800) || (length == 4 && value < 0x10000) ||
+            (value >= 0xD800 && value <= 0xDFFF) || value > 0x10FFFF) {
+            invalidUtf8();
+        }
+        return {value, length};
+    }
+
+    char32_t peekCodePoint() const { return decode(position_).value; }
+
+    char32_t advance() {
+        const CodePoint codePoint = decode(position_);
+        position_ += codePoint.bytes;
+        if (codePoint.value == U'\n' || codePoint.value == 0x2028 ||
+            codePoint.value == 0x2029) {
             ++line_;
             column_ = 1;
         } else {
             ++column_;
         }
-        return character;
+        return codePoint.value;
     }
 
     SourceLocation location() const { return {line_, column_}; }
@@ -150,9 +221,11 @@ private:
 
     void skipWhitespaceAndComments() {
         for (;;) {
-            while (peek() == ' ' || peek() == '\t' || peek() == '\r' || peek() == '\n') advance();
+            while (peek() == ' ' || peek() == '\t' || peek() == '\r' || peek() == '\n' ||
+                   isUnicodeWhitespace(peekCodePoint())) advance();
             if (peek() == '/' && peek(1) == '/') {
-                while (!atEnd() && peek() != '\n') advance();
+                while (!atEnd() && peekCodePoint() != U'\n' &&
+                       peekCodePoint() != 0x2028 && peekCodePoint() != 0x2029) advance();
                 continue;
             }
             if (peek() == '/' && peek(1) == '*') {
@@ -169,18 +242,38 @@ private:
         }
     }
 
-    static bool isIdentifierStart(char character) {
-        return (character >= 'a' && character <= 'z') ||
-               (character >= 'A' && character <= 'Z') || character == '_';
+    static bool isUnicodeWhitespace(char32_t character) {
+        return character == 0x0085 || character == 0x00A0 || character == 0x1680 ||
+               (character >= 0x2000 && character <= 0x200A) ||
+               character == 0x2028 || character == 0x2029 || character == 0x202F ||
+               character == 0x205F || character == 0x3000 || character == 0xFEFF;
     }
 
-    static bool isIdentifierPart(char character) {
-        return isIdentifierStart(character) || (character >= '0' && character <= '9');
+    static bool isUnicodePunctuation(char32_t character) {
+        return (character >= 0x2000 && character <= 0x206F) ||
+               (character >= 0x2E00 && character <= 0x2E7F) ||
+               (character >= 0x3000 && character <= 0x303F) ||
+               (character >= 0xFE10 && character <= 0xFE1F) ||
+               (character >= 0xFE30 && character <= 0xFE4F) ||
+               (character >= 0xFF01 && character <= 0xFF0F) ||
+               (character >= 0xFF1A && character <= 0xFF20) ||
+               (character >= 0xFF3B && character <= 0xFF40) ||
+               (character >= 0xFF5B && character <= 0xFF65);
     }
 
-    Token scanIdentifier(SourceLocation start) {
-        const std::size_t begin = position_ - 1;
-        while (isIdentifierPart(peek())) advance();
+    static bool isIdentifierStart(char32_t character) {
+        if ((character >= U'a' && character <= U'z') ||
+            (character >= U'A' && character <= U'Z') || character == U'_') return true;
+        return character >= 0x80 && !isUnicodeWhitespace(character) &&
+               !isUnicodePunctuation(character);
+    }
+
+    static bool isIdentifierPart(char32_t character) {
+        return isIdentifierStart(character) || (character >= U'0' && character <= U'9');
+    }
+
+    Token scanIdentifier(SourceLocation start, std::size_t begin) {
+        while (isIdentifierPart(peekCodePoint())) advance();
         std::string text(source_.substr(begin, position_ - begin));
         static const std::unordered_map<std::string, TokenKind> keywords = {
             {"void", TokenKind::KwVoid}, {"bool", TokenKind::KwBool},
@@ -189,18 +282,33 @@ private:
             {"number", TokenKind::KwNumber}, {"string", TokenKind::KwString},
             {"message", TokenKind::KwMessage}, {"extern", TokenKind::KwExtern},
             {"building", TokenKind::KwBuilding},
+            {"posc", TokenKind::KwPosc},
+            {"item", TokenKind::KwItem},
+            {"liquid", TokenKind::KwLiquid},
+            {"block", TokenKind::KwBlock},
+            {"unit", TokenKind::KwUnit},
+            {"unit_kind", TokenKind::KwUnitKind},
+            {"team", TokenKind::KwTeam},
+            {"sensor", TokenKind::KwSensor},
+            {"sensor_value", TokenKind::KwSensorValue},
+            {"radar_filter", TokenKind::KwRadarFilter},
+            {"radar_sort", TokenKind::KwRadarSort},
             {"display", TokenKind::KwDisplay},
             {"memory", TokenKind::KwMemory},
             {"arr", TokenKind::KwArr},
             {"arr2d", TokenKind::KwArr2d},
             {"color", TokenKind::KwColor},
             {"packed_color", TokenKind::KwPackedColor},
+            {"restrict", TokenKind::KwRestrict},
             {"struct", TokenKind::KwStruct}, {"sizeof", TokenKind::KwSizeof},
             {"if", TokenKind::KwIf}, {"else", TokenKind::KwElse},
+            {"switch", TokenKind::KwSwitch}, {"case", TokenKind::KwCase},
+            {"default", TokenKind::KwDefault},
             {"while", TokenKind::KwWhile}, {"for", TokenKind::KwFor},
             {"break", TokenKind::KwBreak}, {"continue", TokenKind::KwContinue},
             {"return", TokenKind::KwReturn}, {"true", TokenKind::KwTrue},
-            {"false", TokenKind::KwFalse},
+            {"false", TokenKind::KwFalse}, {"null", TokenKind::KwNull},
+            {"this", TokenKind::KwThis},
         };
         const auto iterator = keywords.find(text);
         return {iterator == keywords.end() ? TokenKind::Identifier : iterator->second,
@@ -229,21 +337,22 @@ private:
     Token scanString(SourceLocation start) {
         std::string value;
         while (!atEnd() && peek() != '"') {
-            char character = advance();
-            if (character == '\\') {
+            const std::size_t characterStart = position_;
+            const char32_t character = advance();
+            if (character == U'\\') {
                 if (atEnd()) break;
-                const char escaped = advance();
+                const char32_t escaped = advance();
                 switch (escaped) {
-                    case 'n': value.push_back('\n'); break;
-                    case 't': value.push_back('\t'); break;
-                    case 'r': value.push_back('\r'); break;
-                    case '"': value.push_back('"'); break;
-                    case '\\': value.push_back('\\'); break;
+                    case U'n': value.push_back('\n'); break;
+                    case U't': value.push_back('\t'); break;
+                    case U'r': value.push_back('\r'); break;
+                    case U'"': value.push_back('"'); break;
+                    case U'\\': value.push_back('\\'); break;
                     default:
                         throw CompileError(start.line, start.column, "不支持的字符串转义");
                 }
             } else {
-                value.push_back(character);
+                value.append(source_.substr(characterStart, position_ - characterStart));
             }
         }
         if (atEnd()) throw CompileError(start.line, start.column, "未结束的字符串");
@@ -253,11 +362,22 @@ private:
 
     Token scanToken() {
         const SourceLocation start = location();
-        const char character = advance();
-        if (isIdentifierStart(character)) return scanIdentifier(start);
-        if (character >= '0' && character <= '9') return scanNumber(start);
+        const std::size_t begin = position_;
+        const char32_t character = advance();
+        if (isIdentifierStart(character)) return scanIdentifier(start, begin);
+        if (character >= U'0' && character <= U'9') return scanNumber(start);
 
         switch (character) {
+            case '@': {
+                if (!isIdentifierStart(peek())) {
+                    throw CompileError(start.line, start.column, "@ 后需要内置常量名称");
+                }
+                const std::size_t begin = position_ - 1;
+                advance();
+                while (isIdentifierPart(peek()) || peek() == '-') advance();
+                return {TokenKind::BuiltinConstant,
+                        std::string(source_.substr(begin, position_ - begin)), start};
+            }
             case '"': return scanString(start);
             case '(': return {TokenKind::LeftParen, "(", start};
             case ')': return {TokenKind::RightParen, ")", start};
@@ -298,14 +418,17 @@ private:
                 return {TokenKind::Greater, ">", start};
             case '&':
                 if (match('&')) return {TokenKind::AndAnd, "&&", start};
-                break;
+                return {TokenKind::Ampersand, "&", start};
             case '|':
                 if (match('|')) return {TokenKind::OrOr, "||", start};
                 break;
+            case '?': return {TokenKind::Question, "?", start};
+            case ':': return {TokenKind::Colon, ":", start};
             case '.': return {TokenKind::Dot, ".", start};
         }
         throw CompileError(start.line, start.column,
-                           std::string("无法识别的字符: ") + character);
+                           "无法识别的字符: " +
+                               std::string(source_.substr(begin, position_ - begin)));
     }
 
     std::string_view source_;
@@ -315,7 +438,8 @@ private:
 };
 
 enum class TypeKind {
-    Void, Bool, Int, Float, Number, String, Message, Building, Display, Memory,
+    Void, Null, Bool, Int, Float, Number, String, Message, Building, Posc, Display, Memory,
+    Item, Liquid, Block, Unit, UnitKind, Team, Sensor, SensorValue, RadarFilter, RadarSort,
     PackedColor, Arr, Arr2d
 };
 
@@ -346,6 +470,7 @@ std::string typeName(const Type& type) {
     if (type.isStruct()) return type.structName;
     switch (type.kind) {
         case TypeKind::Void: return "void";
+        case TypeKind::Null: return "null";
         case TypeKind::Bool: return "bool";
         case TypeKind::Int: return "int";
         case TypeKind::Float: return "float";
@@ -353,8 +478,19 @@ std::string typeName(const Type& type) {
         case TypeKind::String: return "string";
         case TypeKind::Message: return "message";
         case TypeKind::Building: return "building";
+        case TypeKind::Posc: return "posc";
         case TypeKind::Display: return "display";
         case TypeKind::Memory: return "memory";
+        case TypeKind::Item: return "item";
+        case TypeKind::Liquid: return "liquid";
+        case TypeKind::Block: return "block";
+        case TypeKind::Unit: return "unit";
+        case TypeKind::UnitKind: return "unit_kind";
+        case TypeKind::Team: return "team";
+        case TypeKind::Sensor: return "sensor";
+        case TypeKind::SensorValue: return "sensor_value";
+        case TypeKind::RadarFilter: return "radar_filter";
+        case TypeKind::RadarSort: return "radar_sort";
         case TypeKind::PackedColor: return "packed_color";
         case TypeKind::Arr: return "arr<" + typeName(*type.elementType) + ">";
         case TypeKind::Arr2d: return "arr2d<" + typeName(*type.elementType) + ">";
@@ -366,10 +502,215 @@ bool isNumeric(const Type& type) {
     return type == TypeKind::Int || type == TypeKind::Float || type == TypeKind::Number;
 }
 
+std::optional<Type> builtinContentConstantType(std::string_view name);
+
 struct OpFunction {
     std::string_view operation;
     std::size_t arity;
 };
+
+struct LookupFunction {
+    std::string_view content;
+    TypeKind result;
+};
+
+struct RadarConstant {
+    TypeKind type;
+    std::string_view operand;
+};
+
+struct RadarMethod {
+    std::string_view sort;
+    int order;
+};
+
+std::optional<RadarConstant> builtinRadarConstant(std::string_view name) {
+    static const std::unordered_map<std::string_view, RadarConstant> constants = {
+        {"radar_any", {TypeKind::RadarFilter, "any"}},
+        {"radar_enemy", {TypeKind::RadarFilter, "enemy"}},
+        {"radar_ally", {TypeKind::RadarFilter, "ally"}},
+        {"radar_player", {TypeKind::RadarFilter, "player"}},
+        {"radar_attacker", {TypeKind::RadarFilter, "attacker"}},
+        {"radar_flying", {TypeKind::RadarFilter, "flying"}},
+        {"radar_boss", {TypeKind::RadarFilter, "boss"}},
+        {"radar_ground", {TypeKind::RadarFilter, "ground"}},
+        {"radar_distance", {TypeKind::RadarSort, "distance"}},
+        {"radar_health", {TypeKind::RadarSort, "health"}},
+        {"radar_shield", {TypeKind::RadarSort, "shield"}},
+        {"radar_armor", {TypeKind::RadarSort, "armor"}},
+        {"radar_max_health", {TypeKind::RadarSort, "maxHealth"}},
+    };
+    const auto iterator = constants.find(name);
+    return iterator == constants.end() ? std::nullopt
+                                       : std::optional<RadarConstant>(iterator->second);
+}
+
+std::optional<RadarMethod> builtinRadarMethod(std::string_view name) {
+    static const std::unordered_map<std::string_view, RadarMethod> methods = {
+        {"radar_nearest", {"distance", 1}}, {"radar_farthest", {"distance", 0}},
+        {"radar_max_health", {"health", 1}}, {"radar_min_health", {"health", 0}},
+        {"radar_max_shield", {"shield", 1}}, {"radar_min_shield", {"shield", 0}},
+        {"radar_max_armor", {"armor", 1}}, {"radar_min_armor", {"armor", 0}},
+        {"radar_max_max_health", {"maxHealth", 1}},
+        {"radar_min_max_health", {"maxHealth", 0}},
+        {"radar_max_health_limit", {"maxHealth", 1}},
+        {"radar_min_health_limit", {"maxHealth", 0}},
+    };
+    const auto iterator = methods.find(name);
+    return iterator == methods.end() ? std::nullopt
+                                     : std::optional<RadarMethod>(iterator->second);
+}
+
+std::optional<int> builtinBuildRotation(std::string_view name) {
+    static const std::unordered_map<std::string_view, int> rotations = {
+        {"build_right", 0}, {"build_up", 1}, {"build_left", 2}, {"build_down", 3},
+    };
+    const auto iterator = rotations.find(name);
+    return iterator == rotations.end() ? std::nullopt : std::optional<int>(iterator->second);
+}
+
+bool isReservedBuiltinConstant(std::string_view name) {
+    return builtinRadarConstant(name).has_value() || builtinBuildRotation(name).has_value();
+}
+
+bool isRadarSelector(const Type& type) {
+    return type == TypeKind::RadarFilter || type == TypeKind::RadarSort;
+}
+
+bool isSenseableReceiver(const Type& type) {
+    return type == TypeKind::Building || type == TypeKind::Posc || type == TypeKind::Message ||
+           type == TypeKind::Unit ||
+           type == TypeKind::Display || type == TypeKind::Memory || type == TypeKind::Item ||
+           type == TypeKind::Liquid || type == TypeKind::Block || type == TypeKind::UnitKind ||
+           type == TypeKind::Team || type == TypeKind::String || type == TypeKind::SensorValue;
+}
+
+std::optional<Type> sensorResultType(std::string_view sensor, const Type& receiver) {
+    static const std::unordered_map<std::string_view, Type> results = {
+        {"firstItem", TypeKind::Item}, {"currentAmmoType", TypeKind::SensorValue},
+        {"payloadType", TypeKind::SensorValue}, {"config", TypeKind::SensorValue},
+        {"controller", TypeKind::Posc}, {"selectedBlock", TypeKind::Block},
+        {"pingText", TypeKind::String}, {"name", TypeKind::String},
+        {"color", TypeKind::PackedColor}, {"enabled", TypeKind::Bool},
+        {"solid", TypeKind::Bool}, {"dead", TypeKind::Bool}, {"shooting", TypeKind::Bool},
+        {"boosting", TypeKind::Bool}, {"mining", TypeKind::Bool}, {"flying", TypeKind::Bool},
+    };
+    if (sensor == "type") {
+        if (receiver == TypeKind::Unit) return TypeKind::UnitKind;
+        if (receiver == TypeKind::Building || receiver == TypeKind::Message ||
+            receiver == TypeKind::Display || receiver == TypeKind::Memory) return TypeKind::Block;
+        return TypeKind::SensorValue;
+    }
+    if (sensor == "building") {
+        return receiver == TypeKind::Posc || receiver == TypeKind::Unit
+            ? Type(TypeKind::Building) : Type(TypeKind::Block);
+    }
+    if (sensor == "breaking") {
+        return receiver == TypeKind::Posc || receiver == TypeKind::Unit
+            ? Type(TypeKind::Building) : Type(TypeKind::Bool);
+    }
+    const auto iterator = results.find(sensor);
+    if (iterator != results.end()) return iterator->second;
+    return TypeKind::Number;
+}
+
+std::optional<std::string_view> sensorAlias(std::string_view name) {
+    static const std::unordered_map<std::string_view, std::string_view> aliases = {
+        {"get_total_items", "totalItems"}, {"get_first_item", "firstItem"},
+        {"get_total_liquids", "totalLiquids"}, {"get_total_power", "totalPower"},
+        {"get_item_capacity", "itemCapacity"}, {"get_liquid_capacity", "liquidCapacity"},
+        {"get_power_capacity", "powerCapacity"}, {"get_power_net_stored", "powerNetStored"},
+        {"get_power_net_capacity", "powerNetCapacity"}, {"get_power_net_in", "powerNetIn"},
+        {"get_power_net_out", "powerNetOut"}, {"get_ammo", "ammo"},
+        {"get_ammo_capacity", "ammoCapacity"}, {"get_current_ammo_type", "currentAmmoType"},
+        {"get_memory_capacity", "memoryCapacity"}, {"get_health", "health"},
+        {"get_max_health", "maxHealth"}, {"get_heat", "heat"}, {"get_shield", "shield"},
+        {"get_armor", "armor"}, {"get_efficiency", "efficiency"}, {"get_progress", "progress"},
+        {"get_timescale", "timescale"}, {"get_rotation", "rotation"}, {"get_x", "x"},
+        {"get_y", "y"}, {"get_velocity_x", "velocityX"}, {"get_velocity_y", "velocityY"},
+        {"get_shoot_x", "shootX"}, {"get_shoot_y", "shootY"}, {"get_camera_x", "cameraX"},
+        {"get_camera_y", "cameraY"}, {"get_camera_width", "cameraWidth"},
+        {"get_camera_height", "cameraHeight"}, {"get_display_width", "displayWidth"},
+        {"get_display_height", "displayHeight"}, {"get_buffer_size", "bufferSize"},
+        {"get_operations", "operations"}, {"get_size", "size"}, {"get_solid", "solid"},
+        {"get_dead", "dead"}, {"get_range", "range"}, {"get_shooting", "shooting"},
+        {"get_boosting", "boosting"}, {"get_mine_x", "mineX"}, {"get_mine_y", "mineY"},
+        {"get_mining", "mining"}, {"get_build_x", "buildX"}, {"get_build_y", "buildY"},
+        {"get_ping_x", "pingX"}, {"get_ping_y", "pingY"}, {"get_ping_text", "pingText"},
+        {"get_building", "building"}, {"get_breaking", "breaking"}, {"get_speed", "speed"},
+        {"get_team", "team"}, {"get_type", "type"}, {"get_flag", "flag"},
+        {"get_flying", "flying"}, {"get_controlled", "controlled"},
+        {"get_controller", "controller"}, {"get_name", "name"},
+        {"get_payload_count", "payloadCount"}, {"get_payload_type", "payloadType"},
+        {"get_total_payload", "totalPayload"}, {"get_payload_capacity", "payloadCapacity"},
+        {"get_max_units", "maxUnits"}, {"get_id", "id"},
+        {"get_selected_block", "selectedBlock"}, {"get_selected_rotation", "selectedRotation"},
+        {"get_bullet_lifetime", "bulletLifetime"}, {"get_bullet_time", "bulletTime"},
+        {"get_enabled", "enabled"}, {"get_config", "config"}, {"get_color", "color"},
+    };
+    const auto iterator = aliases.find(name);
+    return iterator == aliases.end() ? std::nullopt : std::optional<std::string_view>(iterator->second);
+}
+
+bool isSensorName(std::string_view name) {
+    static const std::unordered_set<std::string_view> names = {
+        "totalItems", "firstItem", "totalLiquids", "totalPower", "itemCapacity", "liquidCapacity",
+        "powerCapacity", "powerNetStored", "powerNetCapacity", "powerNetIn", "powerNetOut", "ammo",
+        "ammoCapacity", "currentAmmoType", "memoryCapacity", "health", "maxHealth", "heat", "shield",
+        "armor", "efficiency", "progress", "timescale", "rotation", "x", "y", "velocityX", "velocityY",
+        "shootX", "shootY", "cameraX", "cameraY", "cameraWidth", "cameraHeight", "displayWidth",
+        "displayHeight", "bufferSize", "operations", "size", "solid", "dead", "range", "shooting",
+        "boosting", "mineX", "mineY", "mining", "buildX", "buildY", "pingX", "pingY", "pingText",
+        "building", "breaking", "speed", "team", "type", "flag", "flying", "controlled", "controller",
+        "name", "payloadCount", "payloadType", "totalPayload", "payloadCapacity", "maxUnits", "id",
+        "selectedBlock", "selectedRotation", "bulletLifetime", "bulletTime", "enabled", "shoot", "shootp",
+        "config", "color",
+    };
+    return names.contains(name);
+}
+
+bool isSenseableSensorName(std::string_view name) {
+    return isSensorName(name) && name != "shoot" && name != "shootp";
+}
+
+std::optional<LookupFunction> builtinLookupFunction(std::string_view name) {
+    static const std::unordered_map<std::string_view, LookupFunction> functions = {
+        {"lookup_block", {"block", TypeKind::Block}},
+        {"lookup_unit", {"unit", TypeKind::UnitKind}},
+        {"lookup_item", {"item", TypeKind::Item}},
+        {"lookup_liquid", {"liquid", TypeKind::Liquid}},
+        {"lookup_team", {"team", TypeKind::Team}},
+    };
+    const auto iterator = functions.find(name);
+    return iterator == functions.end() ? std::nullopt : std::optional<LookupFunction>(iterator->second);
+}
+
+std::optional<Type> configValueMemberType(std::string_view name) {
+    static const std::unordered_map<std::string_view, TypeKind> methods = {
+        {"set_production", TypeKind::UnitKind},
+        {"set_output_item", TypeKind::Item},
+        {"set_output_liquid", TypeKind::Liquid},
+        {"set_sort_item", TypeKind::Item},
+        {"set_unload_item", TypeKind::Item},
+        {"set_delivery_item", TypeKind::Item},
+        {"set_recipe", TypeKind::Block},
+    };
+    const auto iterator = methods.find(name);
+    return iterator == methods.end() ? std::nullopt : std::optional<Type>(iterator->second);
+}
+
+bool isPayloadKindMember(std::string_view name) {
+    return name == "set_payload_kind" || name == "set_straight_payload";
+}
+
+bool isConfigClearMember(std::string_view name) {
+    static const std::unordered_set<std::string_view> methods = {
+        "clear_unit_command", "clear_output_item", "clear_output_liquid",
+        "clear_sort_item", "clear_unload_item", "clear_delivery_item",
+        "clear_payload_kind", "clear_straight_payload", "clear_recipe",
+    };
+    return methods.contains(name);
+}
 
 std::optional<OpFunction> builtinOpFunction(std::string_view name) {
     static const std::unordered_map<std::string_view, OpFunction> functions = {
@@ -434,11 +775,44 @@ std::optional<Type> implicitLinkType(std::string_view name) {
     return TypeKind::Building;
 }
 
+std::optional<Type> builtinContentConstantType(std::string_view name) {
+    if (name.empty() || name.front() != '@') return std::nullopt;
+    name.remove_prefix(1);
+    if (isSensorName(name)) return TypeKind::Sensor;
+
+    static const std::unordered_map<std::string, TypeKind> constants = [] {
+        std::unordered_map<std::string, TypeKind> result;
+        const auto add = [&](TypeKind type, std::string_view names) {
+            while (!names.empty()) {
+                const std::size_t begin = names.find_first_not_of(' ');
+                if (begin == std::string_view::npos) break;
+                names.remove_prefix(begin);
+                const std::size_t end = names.find(' ');
+                const std::string_view entry = names.substr(0, end);
+                result.emplace(std::string(entry), type);
+                if (end == std::string_view::npos) break;
+                names.remove_prefix(end + 1);
+            }
+        };
+
+        add(TypeKind::Item, R"(copper lead metaglass graphite sand coal titanium thorium scrap silicon plastanium phase-fabric surge-alloy spore-pod blast-compound pyratite beryllium tungsten oxide carbide fissile-matter dormant-cyst)");
+        add(TypeKind::Liquid, R"(water slag oil cryofluid neoplasm hydrogen ozone cyanogen gallium nitrogen arkycite)");
+        add(TypeKind::Block, R"(additive-reconstructor advanced-launch-pad afflict air air-factory arc arkycite-floor arkyic-boulder arkyic-stone arkyic-vent arkyic-wall armored-conveyor armored-duct atmospheric-concentrator basalt basalt-boulder basalt-vent basic-assembler-module battery battery-large beam-link beam-node beam-tower beryllic-boulder beryllic-stone beryllic-stone-wall beryllium-wall beryllium-wall-large blast-door blast-drill blast-mixer bluemat boulder breach bridge-conduit bridge-conveyor build-tower canvas carbide-crucible carbide-wall carbide-wall-large carbon-boulder carbon-stone carbon-vent carbon-wall char character-overlay character-overlay-white chemical-combustion-chamber cliff cliff-crusher coal-centrifuge colored-floor colored-wall combustion-generator conduit constructor container conveyor copper-wall copper-wall-large core-acropolis core-bastion core-citadel core-foundation core-nucleus core-shard core-zone crater-stone cryofluid-mixer crystal-blocks crystal-cluster crystal-floor crystal-orbs crystalline-boulder crystalline-stone crystalline-stone-wall crystalline-vent cultivator cyanogen-synthesizer cyclone dacite dacite-boulder dacite-wall dark-metal dark-panel-1 dark-panel-2 dark-panel-3 dark-panel-4 dark-panel-5 dark-panel-6 darksand darksand-tainted-water darksand-water deconstructor deep-tainted-water deep-water dense-red-stone differential-generator diffuse diode dirt dirt-wall disassembler disperse distributor door door-large duct duct-bridge duct-router duct-unloader dune-wall duo electric-heater electrolyzer empty eruption-drill exponential-reconstructor ferric-boulder ferric-craters ferric-stone ferric-stone-wall flux-reactor force-projector foreshadow fuse graphite-press graphitic-wall grass ground-factory hail heat-reactor heat-redirector heat-router heat-source hotrock hyper-processor ice ice-snow ice-wall illuminator impact-drill impact-reactor impulse-pump incinerator interplanetary-accelerator inverted-sorter item-source item-void junction kiln lancer landing-pad large-canvas large-cliff-crusher large-constructor large-logic-display large-payload-mass-driver large-plasma-bore large-shield-projector laser-drill launch-pad liquid-container liquid-junction liquid-router liquid-source liquid-tank liquid-void logic-display logic-processor lustre magmarock malign mass-driver mech-assembler mech-fabricator mech-refabricator mechanical-drill mechanical-pump meltdown melter memory-bank memory-cell mend-projector mender message metal-floor metal-floor-2 metal-floor-3 metal-floor-4 metal-floor-5 metal-floor-damaged metal-tiles-1 metal-tiles-10 metal-tiles-11 metal-tiles-12 metal-tiles-13 metal-tiles-2 metal-tiles-3 metal-tiles-4 metal-tiles-5 metal-tiles-6 metal-tiles-7 metal-tiles-8 metal-tiles-9 metal-wall-1 metal-wall-2 metal-wall-3 micro-processor molten-slag moss mud multi-press multiplicative-reconstructor naval-factory neoplasia-reactor oil-extractor ore-crystal-thorium ore-wall-beryllium ore-wall-graphite ore-wall-thorium ore-wall-tungsten overdrive-dome overdrive-projector overflow-duct overflow-gate oxidation-chamber parallax payload-conveyor payload-loader payload-mass-driver payload-router payload-source payload-unloader payload-void pebbles phase-conduit phase-conveyor phase-heater phase-synthesizer phase-wall phase-wall-large phase-weaver pine plasma-bore plastanium-compressor plastanium-conveyor plastanium-wall plastanium-wall-large plated-conduit pneumatic-drill pooled-cryofluid power-node power-node-large power-source power-void prime-refabricator pulse-conduit pulverizer pur-bush pyratite-mixer pyrolysis-generator radar red-diamond-wall red-ice red-ice-boulder red-ice-wall red-stone red-stone-boulder red-stone-vent red-stone-wall redmat redweed regen-projector regolith regolith-wall reinforced-bridge-conduit reinforced-conduit reinforced-container reinforced-liquid-container reinforced-liquid-junction reinforced-liquid-router reinforced-liquid-tank reinforced-message reinforced-payload-conveyor reinforced-payload-router reinforced-pump reinforced-surge-wall reinforced-surge-wall-large reinforced-vault remove-ore remove-wall repair-point repair-turret rhyolite rhyolite-boulder rhyolite-crater rhyolite-vent rhyolite-wall ripple rotary-pump rough-rhyolite router rtg-generator rune-overlay rune-overlay-crux salt salt-wall salvo sand-boulder sand-floor sand-wall sand-water scathe scatter scorch scrap-wall scrap-wall-gigantic scrap-wall-huge scrap-wall-large segment separator shale shale-boulder shale-wall shallow-water shield-projector shielded-wall ship-assembler ship-fabricator ship-refabricator shock-mine shockwave-tower shrubs silicon-arc-furnace silicon-crucible silicon-smelter slag-centrifuge slag-heater slag-incinerator small-deconstructor small-heat-redirector smite snow snow-boulder snow-pine snow-wall solar-panel solar-panel-large sorter space spawn spectre spore-cluster spore-moss spore-pine spore-press spore-wall steam-generator stone stone-vent stone-wall sublimate surge-conveyor surge-crucible surge-router surge-smelter surge-tower surge-wall surge-wall-large swarmer switch tainted-water tank-assembler tank-fabricator tank-refabricator tar tendrils tetrative-reconstructor thermal-generator thorium-reactor thorium-wall thorium-wall-large thruster tile-logic-display titan titanium-conveyor titanium-wall titanium-wall-large tsunami tungsten-wall tungsten-wall-large turbine-condenser underflow-duct underflow-gate unit-cargo-loader unit-cargo-unload-point unit-repair-tower unloader vault vent-condenser vibrant-crystal-cluster water-extractor wave white-tree white-tree-dead world-cell world-message world-processor world-switch yellow-stone yellow-stone-boulder yellow-stone-plates yellow-stone-vent yellow-stone-wall yellowcoral)");
+        add(TypeKind::UnitKind, R"(dagger mace fortress scepter reign nova pulsar quasar vela corvus crawler atrax spiroct arkyid toxopid flare horizon zenith antumbra eclipse mono poly mega quad oct risso minke bryde sei omura retusa oxynoe cyerce aegires navanax alpha beta gamma stell locus precept vanquish conquer merui cleroi anthicus tecta collaris elude avert obviate quell disrupt evoke incite emanate)");
+        add(TypeKind::Team, R"(derelict sharded crux malis green blue)");
+        return result;
+    }();
+
+    const auto iterator = constants.find(std::string(name));
+    if (iterator == constants.end()) return std::nullopt;
+    return Type(iterator->second);
+}
+
 bool isBuiltinFunction(std::string_view name) {
     return builtinOpFunction(name).has_value() ||
            name == "print" || name == "printchar" || name == "putchar" ||
            name == "format" || name == "printf" || name == "printflush" || name == "drawflush" ||
-           name == "wait" ||
+           name == "wait" || name == "stop" || name == "exit" ||
            name == "rgb" || name == "rgba" || name == "pack_color" || name == "unpack_color" ||
            name == "draw_clear" || name == "draw_color" || name == "draw_col" || name == "set_color" ||
            name == "set_packed_color" ||
@@ -447,11 +821,13 @@ bool isBuiltinFunction(std::string_view name) {
            name == "draw_poly" || name == "draw_line_poly" || name == "draw_triangle" ||
            name == "draw_image" || name == "draw_print" || name == "draw_translate" ||
            name == "draw_scale" || name == "draw_rotate" || name == "draw_reset" ||
-           name == "dot" || name == "cross" || name == "getlink";
+           name == "dot" || name == "cross" || name == "getlink" || name == "unit_bind" ||
+           builtinLookupFunction(name).has_value();
 }
 
 struct Expr {
-    enum class Kind { Number, String, Boolean, Variable, Unary, Binary, Assign, Call, Prefix, Postfix,
+    enum class Kind { Number, String, Boolean, Null, Variable, Unary, Binary, Conditional,
+                      Assign, Call, Prefix, Postfix,
                       Member, Index, InitializerList, TypedInitializer, Sizeof };
 
     Kind kind = Kind::Number;
@@ -460,19 +836,28 @@ struct Expr {
     bool boolean = false;
     std::unique_ptr<Expr> left;
     std::unique_ptr<Expr> right;
+    std::unique_ptr<Expr> third;
     std::unique_ptr<Expr> receiver;
     std::vector<std::unique_ptr<Expr>> arguments;
     Type declaredType;
 };
 
 struct Stmt {
-    enum class Kind { Empty, Block, Variable, Expression, If, While, For, Break, Continue, Return };
+    enum class Kind { Empty, Block, Variable, Expression, If, Switch, While, For,
+                      Break, Continue, Return };
+
+    struct SwitchClause {
+        std::optional<long long> value;
+        SourceLocation location;
+        std::vector<std::unique_ptr<Stmt>> statements;
+    };
 
     Kind kind = Kind::Block;
     SourceLocation location;
     Type type;
     std::string name;
     std::vector<std::unique_ptr<Stmt>> statements;
+    std::vector<SwitchClause> switchClauses;
     std::unique_ptr<Stmt> initializerStatement;
     std::unique_ptr<Expr> expression;
     std::unique_ptr<Expr> condition;
@@ -485,11 +870,15 @@ struct Parameter {
     Type type;
     std::string name;
     SourceLocation location;
+    bool reference = false;
+    bool restricted = false;
 };
 
 struct FunctionDecl {
     Type returnType;
     std::string name;
+    std::string memberOf;
+    std::string memberName;
     std::vector<Parameter> parameters;
     std::unique_ptr<Stmt> body;
     SourceLocation location;
@@ -562,6 +951,9 @@ public:
                 program.globals.push_back(parseGlobal(type, name, external));
             }
         }
+        for (FunctionDecl& function : memberFunctions_) {
+            program.functions.push_back(std::move(function));
+        }
         return program;
     }
 
@@ -588,12 +980,19 @@ private:
         throw CompileError(token.location.line, token.location.column, message);
     }
 
-    bool isTypeToken(TokenKind kind) const {
+bool isTypeToken(TokenKind kind) const {
         return kind == TokenKind::KwVoid || kind == TokenKind::KwBool ||
                kind == TokenKind::KwInt || kind == TokenKind::KwFloat ||
                kind == TokenKind::KwDouble ||
                kind == TokenKind::KwNumber || kind == TokenKind::KwString ||
                kind == TokenKind::KwMessage || kind == TokenKind::KwBuilding ||
+               kind == TokenKind::KwPosc ||
+               kind == TokenKind::KwItem || kind == TokenKind::KwLiquid ||
+               kind == TokenKind::KwBlock || kind == TokenKind::KwUnit ||
+               kind == TokenKind::KwUnitKind ||
+               kind == TokenKind::KwTeam || kind == TokenKind::KwSensor ||
+               kind == TokenKind::KwSensorValue || kind == TokenKind::KwRadarFilter ||
+               kind == TokenKind::KwRadarSort ||
                kind == TokenKind::KwDisplay || kind == TokenKind::KwMemory ||
                kind == TokenKind::KwArr || kind == TokenKind::KwArr2d ||
                kind == TokenKind::KwColor ||
@@ -630,6 +1029,17 @@ private:
             case TokenKind::KwString: return TypeKind::String;
             case TokenKind::KwMessage: return TypeKind::Message;
             case TokenKind::KwBuilding: return TypeKind::Building;
+            case TokenKind::KwPosc: return TypeKind::Posc;
+            case TokenKind::KwItem: return TypeKind::Item;
+            case TokenKind::KwLiquid: return TypeKind::Liquid;
+            case TokenKind::KwBlock: return TypeKind::Block;
+            case TokenKind::KwUnit: return TypeKind::Unit;
+            case TokenKind::KwUnitKind: return TypeKind::UnitKind;
+            case TokenKind::KwTeam: return TypeKind::Team;
+            case TokenKind::KwSensor: return TypeKind::Sensor;
+            case TokenKind::KwSensorValue: return TypeKind::SensorValue;
+            case TokenKind::KwRadarFilter: return TypeKind::RadarFilter;
+            case TokenKind::KwRadarSort: return TypeKind::RadarSort;
             case TokenKind::KwDisplay: return TypeKind::Display;
             case TokenKind::KwMemory: return TypeKind::Memory;
             case TokenKind::KwArr:
@@ -657,34 +1067,61 @@ private:
         declaration.location = keyword.location;
         consume(TokenKind::LeftBrace, "结构体定义需要左大括号");
         std::unordered_set<std::string> fieldNames;
+        std::unordered_set<std::string> methodNames;
         while (!check(TokenKind::RightBrace) && !check(TokenKind::End)) {
-            const Type fieldType = parseType();
-            const Token fieldName = consume(TokenKind::Identifier, "字段类型后需要名称");
-            if (fieldType == TypeKind::Void) fail(fieldName, "字段不能是 void 类型");
-            if (!fieldNames.insert(fieldName.text).second) fail(fieldName, "重复的字段名称: " + fieldName.text);
-            consume(TokenKind::Semicolon, "字段声明后需要分号");
-            declaration.fields.push_back({fieldType, fieldName.text, fieldName.location});
+            const Type memberType = parseType();
+            const Token memberName = consume(TokenKind::Identifier, "成员类型后需要名称");
+            if (match(TokenKind::LeftParen)) {
+                if (fieldNames.contains(memberName.text) || !methodNames.insert(memberName.text).second) {
+                    fail(memberName, "重复的成员名称: " + memberName.text);
+                }
+                FunctionDecl function = parseFunction(memberType, memberName, name.text);
+                function.memberOf = name.text;
+                function.memberName = memberName.text;
+                function.name = "__member_" + name.text + "_" + memberName.text;
+                function.parameters.insert(function.parameters.begin(),
+                    {Type(name.text), "__this", memberName.location, true, true});
+                memberFunctions_.push_back(std::move(function));
+            } else {
+                if (memberType == TypeKind::Void) fail(memberName, "字段不能是 void 类型");
+                if (methodNames.contains(memberName.text) || !fieldNames.insert(memberName.text).second) {
+                    fail(memberName, "重复的成员名称: " + memberName.text);
+                }
+                consume(TokenKind::Semicolon, "字段声明后需要分号");
+                declaration.fields.push_back({memberType, memberName.text, memberName.location});
+            }
         }
         consume(TokenKind::RightBrace, "结构体定义缺少右大括号");
         consume(TokenKind::Semicolon, "结构体定义后需要分号");
         return declaration;
     }
 
-    FunctionDecl parseFunction(Type returnType, const Token& name) {
+    FunctionDecl parseFunction(Type returnType, const Token& name,
+                               const std::string& memberOf = "") {
         FunctionDecl function;
         function.returnType = returnType;
         function.name = name.text;
         function.location = name.location;
         if (!check(TokenKind::RightParen)) {
             do {
+                const bool restricted = match(TokenKind::KwRestrict);
                 const Type parameterType = parseType();
                 if (parameterType == TypeKind::Void) fail(previous(), "参数不能是 void 类型");
+                const bool reference = match(TokenKind::Ampersand);
+                if (restricted && !reference) fail(previous(), "restrict 只能修饰引用参数");
+                if (reference && parameterType.isArray()) {
+                    fail(previous(), "引用参数暂不支持 arr 或 arr2d 类型");
+                }
                 const Token parameterName = consume(TokenKind::Identifier, "参数类型后需要名称");
-                function.parameters.push_back({parameterType, parameterName.text, parameterName.location});
+                function.parameters.push_back({parameterType, parameterName.text, parameterName.location,
+                                               reference, restricted});
             } while (match(TokenKind::Comma));
         }
         consume(TokenKind::RightParen, "参数列表缺少右括号");
+        const std::string previousMember = currentMemberStruct_;
+        currentMemberStruct_ = memberOf;
         function.body = parseBlock();
+        currentMemberStruct_ = previousMember;
         return function;
     }
 
@@ -723,6 +1160,7 @@ private:
         }
         if (check(TokenKind::LeftBrace)) return parseBlock();
         if (match(TokenKind::KwIf)) return parseIf(previous());
+        if (match(TokenKind::KwSwitch)) return parseSwitch(previous());
         if (match(TokenKind::KwWhile)) return parseWhile(previous());
         if (match(TokenKind::KwFor)) return parseFor(previous());
         if (match(TokenKind::KwBreak)) return parseSimple(Stmt::Kind::Break, previous());
@@ -762,6 +1200,66 @@ private:
         consume(TokenKind::RightParen, "if 条件后需要右括号");
         statement->thenBranch = parseStatement();
         if (match(TokenKind::KwElse)) statement->elseBranch = parseStatement();
+        return statement;
+    }
+
+    long long parseCaseValue() {
+        std::string text;
+        SourceLocation location = current().location;
+        if (match(TokenKind::Minus)) {
+            text.push_back('-');
+        } else {
+            (void)match(TokenKind::Plus);
+        }
+        const Token literal = consume(TokenKind::NumberLiteral,
+                                      "case 后需要整数常量");
+        text += literal.text;
+        if (literal.text.find_first_of(".eE") != std::string::npos) {
+            fail(literal, "case 值必须是整数常量");
+        }
+        long long value = 0;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (error != std::errc{} || end != text.data() + text.size()) {
+            throw CompileError(location.line, location.column, "case 整数常量超出范围");
+        }
+        return value;
+    }
+
+    std::unique_ptr<Stmt> parseSwitch(const Token& keyword) {
+        auto statement = std::make_unique<Stmt>();
+        statement->kind = Stmt::Kind::Switch;
+        statement->location = keyword.location;
+        consume(TokenKind::LeftParen, "switch 后需要左括号");
+        statement->condition = parseExpression();
+        consume(TokenKind::RightParen, "switch 条件后需要右括号");
+        consume(TokenKind::LeftBrace, "switch 需要左大括号");
+
+        std::unordered_set<long long> values;
+        bool hasDefault = false;
+        while (!check(TokenKind::RightBrace) && !check(TokenKind::End)) {
+            Stmt::SwitchClause clause;
+            if (match(TokenKind::KwCase)) {
+                clause.location = previous().location;
+                clause.value = parseCaseValue();
+                if (!values.insert(*clause.value).second) {
+                    throw CompileError(clause.location.line, clause.location.column,
+                                       "重复的 case 值: " + std::to_string(*clause.value));
+                }
+            } else if (match(TokenKind::KwDefault)) {
+                clause.location = previous().location;
+                if (hasDefault) fail(previous(), "switch 只能有一个 default");
+                hasDefault = true;
+            } else {
+                fail(current(), "switch 中的语句必须位于 case 或 default 之后");
+            }
+            consume(TokenKind::Colon, "case 或 default 后需要冒号");
+            while (!check(TokenKind::KwCase) && !check(TokenKind::KwDefault) &&
+                   !check(TokenKind::RightBrace) && !check(TokenKind::End)) {
+                clause.statements.push_back(parseStatement());
+            }
+            statement->switchClauses.push_back(std::move(clause));
+        }
+        consume(TokenKind::RightBrace, "switch 缺少右大括号");
         return statement;
     }
 
@@ -821,7 +1319,7 @@ private:
     std::unique_ptr<Expr> parseExpression() { return parseAssignment(); }
 
     std::unique_ptr<Expr> parseAssignment() {
-        auto expression = parseLogicalOr();
+        auto expression = parseConditional();
         if (match(TokenKind::Equal) || match(TokenKind::PlusEqual) ||
             match(TokenKind::MinusEqual) || match(TokenKind::StarEqual) ||
             match(TokenKind::SlashEqual) || match(TokenKind::PercentEqual)) {
@@ -835,6 +1333,20 @@ private:
             return assignment;
         }
         return expression;
+    }
+
+    std::unique_ptr<Expr> parseConditional() {
+        auto expression = parseLogicalOr();
+        if (!match(TokenKind::Question)) return expression;
+        const Token question = previous();
+        auto conditional = std::make_unique<Expr>();
+        conditional->kind = Expr::Kind::Conditional;
+        conditional->location = question.location;
+        conditional->left = std::move(expression);
+        conditional->right = parseExpression();
+        consume(TokenKind::Colon, "三目运算符缺少冒号");
+        conditional->third = parseConditional();
+        return conditional;
     }
 
     std::unique_ptr<Expr> parseLogicalOr() {
@@ -1009,7 +1521,37 @@ private:
             expression->boolean = token.kind == TokenKind::KwTrue;
             return expression;
         }
+        if (match(TokenKind::KwNull)) {
+            auto expression = std::make_unique<Expr>();
+            expression->kind = Expr::Kind::Null;
+            expression->location = token.location;
+            return expression;
+        }
+        if (match(TokenKind::KwThis)) {
+            if (currentMemberStruct_.empty()) fail(token, "this-> 只能用于成员函数");
+            if (!match(TokenKind::Minus) || !match(TokenKind::Greater)) {
+                fail(token, "this 不能作为独立表达式，只支持 this->成员");
+            }
+            const Token memberName = consume(TokenKind::Identifier, "this-> 后需要成员名称");
+            auto receiver = std::make_unique<Expr>();
+            receiver->kind = Expr::Kind::Variable;
+            receiver->location = token.location;
+            receiver->text = "__this";
+            auto member = std::make_unique<Expr>();
+            member->kind = Expr::Kind::Member;
+            member->location = memberName.location;
+            member->text = memberName.text;
+            member->left = std::move(receiver);
+            return member;
+        }
         if (match(TokenKind::Identifier)) {
+            auto expression = std::make_unique<Expr>();
+            expression->kind = Expr::Kind::Variable;
+            expression->location = token.location;
+            expression->text = token.text;
+            return expression;
+        }
+        if (match(TokenKind::BuiltinConstant)) {
             auto expression = std::make_unique<Expr>();
             expression->kind = Expr::Kind::Variable;
             expression->location = token.location;
@@ -1054,6 +1596,8 @@ private:
     std::vector<Token> tokens_;
     std::size_t position_ = 0;
     std::unordered_set<std::string> structTypes_;
+    std::vector<FunctionDecl> memberFunctions_;
+    std::string currentMemberStruct_;
 };
 
 struct IrInstruction {
@@ -1065,6 +1609,7 @@ struct IrInstruction {
     std::string label;
     std::vector<std::string> operands;
     std::vector<OperandRole> operandRoles;
+    std::vector<std::string> indirectTargets;
 
     bool operator==(const IrInstruction&) const = default;
 
@@ -1078,7 +1623,8 @@ struct IrInstruction {
         if (kind == Kind::Label) return false;
         if (isTerminator()) return true;
         return opcode != "set" && opcode != "op" && opcode != "read" &&
-               opcode != "getlink" && opcode != "packcolor" && opcode != "unpackcolor";
+               opcode != "getlink" && opcode != "lookup" &&
+               opcode != "packcolor" && opcode != "unpackcolor";
     }
 
     [[nodiscard]] std::vector<std::size_t> definitions() const {
@@ -1110,13 +1656,28 @@ public:
         if (!labels_.emplace(name, instructions_.size()).second) {
             throw std::logic_error("重复的内部标签: " + name);
         }
-        instructions_.push_back({IrInstruction::Kind::Label, {}, name, {}, {}});
+        instructions_.push_back({IrInstruction::Kind::Label, {}, name, {}, {}, {}});
     }
 
     void emit(std::string opcode, std::vector<std::string> operands = {}) {
         std::vector<IrInstruction::OperandRole> roles = operandRoles(opcode, operands.size());
+        if (opcode == "ucontrol" && !operands.empty()) {
+            roles[0] = IrInstruction::OperandRole::Metadata;
+            if (operands[0] == "getBlock" && roles.size() >= 6) {
+                roles[3] = IrInstruction::OperandRole::Definition;
+                roles[4] = IrInstruction::OperandRole::Definition;
+                roles[5] = IrInstruction::OperandRole::Definition;
+            } else if (operands[0] == "within" && roles.size() >= 5) {
+                roles[4] = IrInstruction::OperandRole::Definition;
+            }
+        }
         instructions_.push_back({IrInstruction::Kind::Operation, std::move(opcode), {},
-                                 std::move(operands), std::move(roles)});
+                                 std::move(operands), std::move(roles), {}});
+    }
+
+    void emitCounterJump(std::string target, std::vector<std::string> possibleTargets) {
+        emit("set", {"@counter", std::move(target)});
+        instructions_.back().indirectTargets = std::move(possibleTargets);
     }
 
     [[nodiscard]] std::string finish() const {
@@ -1137,7 +1698,7 @@ public:
         std::ostringstream output;
         for (const IrInstruction& instruction : instructions_) {
             if (instruction.kind == IrInstruction::Kind::Label) continue;
-            output << instruction.opcode;
+            output << (instruction.opcode == "ubindunit" ? "ubind" : instruction.opcode);
             for (const std::string& operand : instruction.operands) {
                 output << ' ';
                 if (!operand.empty() && operand.front() == '$') {
@@ -1174,6 +1735,8 @@ public:
 
                 IrBuilder candidate = *this;
                 if (!candidate.inlineAllCalls(entryLabel, functionName)) continue;
+                candidate.optimizeLocalAssignments();
+                candidate.optimizeUnitBindings();
                 candidate.optimizeLocalAssignments();
                 if (candidate.operationCount() < operationCount()) {
                     *this = std::move(candidate);
@@ -1258,10 +1821,19 @@ public:
                 }
             } else if (terminal != nullptr && terminal->opcode == "set" &&
                        terminal->operands.size() >= 2 && terminal->operands.front() == "@counter") {
-                const auto continuations = returnContinuations.find(terminal->operands[1]);
-                if (continuations != returnContinuations.end()) {
-                    current.successors.insert(current.successors.end(), continuations->second.begin(),
-                                              continuations->second.end());
+                if (!terminal->indirectTargets.empty()) {
+                    for (const std::string& label : terminal->indirectTargets) {
+                        const auto target = labelPositions.find(label);
+                        if (target != labelPositions.end()) {
+                            current.successors.push_back(blockAt[target->second]);
+                        }
+                    }
+                } else {
+                    const auto continuations = returnContinuations.find(terminal->operands[1]);
+                    if (continuations != returnContinuations.end()) {
+                        current.successors.insert(current.successors.end(), continuations->second.begin(),
+                                                  continuations->second.end());
+                    }
                 }
             } else if (block + 1 < blocks.size()) {
                 current.successors.push_back(block + 1);
@@ -1276,6 +1848,52 @@ public:
             optimizeLocalAssignmentsPass();
             if (instructions_ == previous) return;
         }
+    }
+
+    void optimizeUnitBindings() {
+        const std::vector<IrBasicBlock> blocks = basicBlocks();
+        for (const IrBasicBlock& block : blocks) {
+            std::unordered_set<std::string> aliases;
+            for (std::size_t index = block.begin; index < block.end; ++index) {
+                IrInstruction& instruction = instructions_[index];
+                if (instruction.kind == IrInstruction::Kind::Label) continue;
+
+                if (instruction.opcode == "ubind" || instruction.opcode == "ubindunit") {
+                    const bool directUnit = instruction.opcode == "ubindunit";
+                    const std::string operand = instruction.operands.front();
+                    if (directUnit && aliases.contains(operand)) {
+                        instruction.opcode.clear();
+                        instruction.operands.clear();
+                        instruction.operandRoles.clear();
+                        continue;
+                    }
+                    aliases.clear();
+                    aliases.insert("@unit");
+                    if (directUnit) aliases.insert(operand);
+                    continue;
+                }
+
+                if (instruction.opcode == "ucontrol" && !instruction.operands.empty() &&
+                    instruction.operands[0] == "unbind") {
+                    aliases.clear();
+                    continue;
+                }
+
+                const std::vector<std::size_t> definitions = instruction.definitions();
+                const bool copiedBinding = instruction.opcode == "set" &&
+                                           instruction.operands.size() >= 2 &&
+                                           aliases.contains(instruction.operands[1]);
+                for (const std::size_t definition : definitions) {
+                    if (definition < instruction.operands.size()) aliases.erase(instruction.operands[definition]);
+                }
+                if (copiedBinding) aliases.insert(instruction.operands[0]);
+            }
+        }
+        instructions_.erase(std::remove_if(instructions_.begin(), instructions_.end(),
+                                           [](const IrInstruction& instruction) {
+                                               return instruction.kind == IrInstruction::Kind::Operation &&
+                                                      instruction.opcode.empty();
+                                           }), instructions_.end());
     }
 
     void optimizeLocalAssignmentsPass() {
@@ -1495,6 +2113,10 @@ private:
                         const auto renamed = renamedLabels.find(operand.substr(1));
                         if (renamed != renamedLabels.end()) operand = "$" + renamed->second;
                     }
+                    for (std::string& target : bodyInstruction.indirectTargets) {
+                        const auto renamed = renamedLabels.find(target);
+                        if (renamed != renamedLabels.end()) target = renamed->second;
+                    }
                     if (bodyInstruction.opcode == "set" && bodyInstruction.operands.size() >= 2 &&
                         bodyInstruction.operands[0] == "@counter" &&
                         bodyInstruction.operands[1] == returnAddress) {
@@ -1502,6 +2124,7 @@ private:
                         bodyInstruction.operands = {"$" + callReturnLabel, "always", "0", "0"};
                         bodyInstruction.operandRoles = operandRoles(bodyInstruction.opcode,
                                                                     bodyInstruction.operands.size());
+                        bodyInstruction.indirectTargets.clear();
                     }
                 }
                 rewritten.push_back(std::move(bodyInstruction));
@@ -1548,6 +2171,9 @@ private:
         if (opcode == "set" || opcode == "read" || opcode == "getlink" || opcode == "packcolor" ||
             opcode == "sensor") {
             if (!roles.empty()) roles[0] = Role::Definition;
+        } else if (opcode == "lookup") {
+            if (!roles.empty()) roles[0] = Role::Metadata;
+            if (roles.size() > 1) roles[1] = Role::Definition;
         } else if (opcode == "op") {
             if (!roles.empty()) roles[0] = Role::Metadata;
             if (roles.size() > 1) roles[1] = Role::Definition;
@@ -1555,6 +2181,8 @@ private:
             if (!roles.empty()) roles[0] = Role::Label;
             if (roles.size() > 1) roles[1] = Role::Metadata;
         } else if (opcode == "draw") {
+            if (!roles.empty()) roles[0] = Role::Metadata;
+        } else if (opcode == "control") {
             if (!roles.empty()) roles[0] = Role::Metadata;
         } else if (opcode == "unpackcolor") {
             for (std::size_t index = 0; index < std::min<std::size_t>(4, roles.size()); ++index) {
@@ -1588,7 +2216,16 @@ struct ExpressionResult {
     std::string operand;
     bool lvalue = false;
     std::vector<std::string> components;
-    struct MemoryLocation { std::string handle; std::string address; };
+    struct MemoryLocation {
+        std::string handle;
+        std::string address;
+        std::string identityHandle;
+        std::string identityBase;
+        std::string identityIndex;
+        long long indexScale = 0;
+        long long constantOffset = 0;
+        bool normalized = false;
+    };
     std::optional<MemoryLocation> memoryLocation;
 
     ExpressionResult() = default;
@@ -1614,14 +2251,18 @@ public:
 
         currentContext_ = "init";
         for (const GlobalDecl& global : program_.globals) generateGlobalInitializer(global);
+        if (functions_.contains("main_init")) generateMainInit();
         emitter_.emit("jump", {reference(mainEntryLabel_), "always", "0", "0"});
 
         for (const FunctionDecl& function : program_.functions) {
-            if (function.name != "main_loop" && reachableFunctions_.contains(function.name)) {
+            if (function.name != "main_loop" && function.name != "main_init" &&
+                reachableFunctions_.contains(function.name)) {
                 generateFunction(function);
             }
         }
         generateMainLoop();
+        emitter_.optimizeLocalAssignments();
+        emitter_.optimizeUnitBindings();
         emitter_.optimizeLocalAssignments();
         emitter_.optimizeInlining(inlineOrder_);
         return emitter_.finish();
@@ -1671,8 +2312,20 @@ private:
             case TypeKind::String: return "\"\"";
             case TypeKind::Message:
             case TypeKind::Building:
+            case TypeKind::Posc:
             case TypeKind::Display:
-            case TypeKind::Memory: return "null";
+            case TypeKind::Memory:
+            case TypeKind::Item:
+            case TypeKind::Liquid:
+            case TypeKind::Block:
+            case TypeKind::Unit:
+            case TypeKind::UnitKind:
+            case TypeKind::Team:
+            case TypeKind::Sensor:
+            case TypeKind::SensorValue:
+            case TypeKind::RadarFilter:
+            case TypeKind::RadarSort: return "null";
+            case TypeKind::Null: return "null";
             case TypeKind::PackedColor: return "0";
             case TypeKind::Arr:
             case TypeKind::Arr2d: return "null";
@@ -1683,6 +2336,9 @@ private:
 
     void collectStructDeclarations() {
         for (const StructDecl& declaration : program_.structs) {
+            if (isReservedBuiltinConstant(declaration.name)) {
+                fail(declaration.location, "内置常量名称不能被声明: " + declaration.name);
+            }
             if (!structs_.emplace(declaration.name, &declaration).second) {
                 fail(declaration.location, "重复的结构体名称: " + declaration.name);
             }
@@ -1700,14 +2356,24 @@ private:
                 return;
             }
             states[type.structName] = State::Visiting;
-            for (const StructField& field : declaration->second->fields) validate(field.type, field.location);
+            for (const StructField& field : declaration->second->fields) {
+                if (isReservedBuiltinConstant(field.name)) {
+                    fail(field.location, "内置常量名称不能被声明: " + field.name);
+                }
+                validate(field.type, field.location);
+            }
             states[type.structName] = State::Complete;
         };
         for (const StructDecl& declaration : program_.structs) validate(Type(declaration.name), declaration.location);
         std::function<bool(const Type&, std::unordered_set<std::string>&)> storable =
             [&](const Type& type, std::unordered_set<std::string>& visiting) {
                 if (type.isArray() || type == TypeKind::Memory || type == TypeKind::String ||
-                    type == TypeKind::Message || type == TypeKind::Building || type == TypeKind::Display ||
+                    type == TypeKind::Message || type == TypeKind::Building || type == TypeKind::Posc ||
+                    type == TypeKind::Display || type == TypeKind::Item || type == TypeKind::Liquid ||
+                    type == TypeKind::Block || type == TypeKind::Unit ||
+                    type == TypeKind::UnitKind || type == TypeKind::Team ||
+                    type == TypeKind::Sensor || type == TypeKind::SensorValue ||
+                    type == TypeKind::RadarFilter || type == TypeKind::RadarSort ||
                     type == TypeKind::Void) return false;
                 if (!type.isStruct()) return true;
                 if (!visiting.insert(type.structName).second) return true;
@@ -1732,11 +2398,17 @@ private:
             }
             validateExpression(expression->left.get());
             validateExpression(expression->right.get());
+            validateExpression(expression->third.get());
             for (const auto& argument : expression->arguments) validateExpression(argument.get());
         };
         std::function<void(const Stmt*)> validateStatement = [&](const Stmt* statement) {
             if (statement == nullptr) return;
-            if (statement->kind == Stmt::Kind::Variable) validateArray(statement->type, statement->location);
+            if (statement->kind == Stmt::Kind::Variable) {
+                if (isRadarSelector(statement->type)) {
+                    fail(statement->location, "Radar 选择器类型不能声明变量");
+                }
+                validateArray(statement->type, statement->location);
+            }
             validateExpression(statement->expression.get());
             validateExpression(statement->condition.get());
             validateExpression(statement->increment.get());
@@ -1744,17 +2416,42 @@ private:
             validateStatement(statement->thenBranch.get());
             validateStatement(statement->elseBranch.get());
             for (const auto& child : statement->statements) validateStatement(child.get());
+            for (const auto& clause : statement->switchClauses) {
+                for (const auto& child : clause.statements) validateStatement(child.get());
+            }
         };
         for (const StructDecl& declaration : program_.structs) {
-            for (const StructField& field : declaration.fields) validateArray(field.type, field.location);
+            for (const StructField& field : declaration.fields) {
+                if (isRadarSelector(field.type)) {
+                    fail(field.location, "Radar 选择器类型不能用于结构体字段");
+                }
+                validateArray(field.type, field.location);
+            }
         }
         for (const GlobalDecl& global : program_.globals) {
+            if (isReservedBuiltinConstant(global.name)) {
+                fail(global.location, "内置常量名称不能被声明: " + global.name);
+            }
+            if (isRadarSelector(global.type)) {
+                fail(global.location, "Radar 选择器类型不能声明变量");
+            }
             validateArray(global.type, global.location);
             validateExpression(global.initializer.get());
         }
         for (const FunctionDecl& function : program_.functions) {
+            if (isReservedBuiltinConstant(function.name)) {
+                fail(function.location, "内置常量名称不能被声明: " + function.name);
+            }
+            if (isRadarSelector(function.returnType)) {
+                fail(function.location, "Radar 选择器类型不能作为函数返回类型");
+            }
             validateArray(function.returnType, function.location);
-            for (const Parameter& parameter : function.parameters) validateArray(parameter.type, parameter.location);
+            for (const Parameter& parameter : function.parameters) {
+                if (isRadarSelector(parameter.type)) {
+                    fail(parameter.location, "Radar 选择器类型不能作为函数参数");
+                }
+                validateArray(parameter.type, parameter.location);
+            }
             validateStatement(function.body.get());
         }
     }
@@ -1821,6 +2518,13 @@ private:
             if (isBuiltinFunction(function.name)) {
                 fail(function.location, "不能重新定义内置函数 " + function.name);
             }
+            if (!function.memberOf.empty()) {
+                auto& methods = memberFunctions_[function.memberOf];
+                if (!methods.emplace(function.memberName, function.name).second) {
+                    fail(function.location, "重复的成员函数: " + function.memberOf + "." +
+                                            function.memberName);
+                }
+            }
 
             FunctionInfo info;
             info.declaration = &function;
@@ -1832,6 +2536,9 @@ private:
             std::unordered_set<std::string> parameterNames;
             for (std::size_t index = 0; index < function.parameters.size(); ++index) {
                 const Parameter& parameter = function.parameters[index];
+                if (isReservedBuiltinConstant(parameter.name)) {
+                    fail(parameter.location, "内置常量名称不能被声明: " + parameter.name);
+                }
                 if (implicitLinkType(parameter.name)) {
                     fail(parameter.location, "Mindustry 链接标识符不能被声明: " + parameter.name);
                 }
@@ -1850,6 +2557,14 @@ private:
         if (main.returnType != TypeKind::Void || !main.parameters.empty()) {
             fail(main.location, "入口必须声明为 void main_loop()");
         }
+
+        const auto initIterator = functions_.find("main_init");
+        if (initIterator != functions_.end()) {
+            const FunctionDecl& init = *initIterator->second.declaration;
+            if (init.returnType != TypeKind::Void || !init.parameters.empty()) {
+                fail(init.location, "初始化入口必须声明为 void main_init()");
+            }
+        }
     }
 
     static void collectCalls(const Expr* expression, std::vector<std::pair<std::string, SourceLocation>>& calls) {
@@ -1860,8 +2575,23 @@ private:
         }
         collectCalls(expression->left.get(), calls);
         collectCalls(expression->right.get(), calls);
+        collectCalls(expression->third.get(), calls);
         collectCalls(expression->receiver.get(), calls);
         for (const auto& argument : expression->arguments) collectCalls(argument.get(), calls);
+    }
+
+    static void collectMemberCalls(const Expr* expression,
+                                   std::vector<std::pair<std::string, SourceLocation>>& calls) {
+        if (expression == nullptr) return;
+        if (expression->kind == Expr::Kind::Sizeof) return;
+        if (expression->kind == Expr::Kind::Call && expression->receiver) {
+            calls.emplace_back(expression->text, expression->location);
+        }
+        collectMemberCalls(expression->left.get(), calls);
+        collectMemberCalls(expression->right.get(), calls);
+        collectMemberCalls(expression->third.get(), calls);
+        collectMemberCalls(expression->receiver.get(), calls);
+        for (const auto& argument : expression->arguments) collectMemberCalls(argument.get(), calls);
     }
 
     static void collectCalls(const Stmt* statement, std::vector<std::pair<std::string, SourceLocation>>& calls) {
@@ -1873,6 +2603,40 @@ private:
         collectCalls(statement->thenBranch.get(), calls);
         collectCalls(statement->elseBranch.get(), calls);
         for (const auto& child : statement->statements) collectCalls(child.get(), calls);
+        for (const auto& clause : statement->switchClauses) {
+            for (const auto& child : clause.statements) collectCalls(child.get(), calls);
+        }
+    }
+
+    static void collectMemberCalls(const Stmt* statement,
+                                   std::vector<std::pair<std::string, SourceLocation>>& calls) {
+        if (statement == nullptr) return;
+        collectMemberCalls(statement->expression.get(), calls);
+        collectMemberCalls(statement->condition.get(), calls);
+        collectMemberCalls(statement->increment.get(), calls);
+        collectMemberCalls(statement->initializerStatement.get(), calls);
+        collectMemberCalls(statement->thenBranch.get(), calls);
+        collectMemberCalls(statement->elseBranch.get(), calls);
+        for (const auto& child : statement->statements) collectMemberCalls(child.get(), calls);
+        for (const auto& clause : statement->switchClauses) {
+            for (const auto& child : clause.statements) collectMemberCalls(child.get(), calls);
+        }
+    }
+
+    void appendMemberCallEdges(const std::vector<std::pair<std::string, SourceLocation>>& calls,
+                               std::vector<std::string>& edges) const {
+        for (const auto& [methodName, location] : calls) {
+            bool found = false;
+            for (const auto& [owner, methods] : memberFunctions_) {
+                (void)owner;
+                const auto method = methods.find(methodName);
+                if (method == methods.end()) continue;
+                edges.push_back(method->second);
+                found = true;
+            }
+            (void)location;
+            (void)found;
+        }
     }
 
     void validateCallGraph() {
@@ -1883,10 +2647,23 @@ private:
             collectCalls(function.body.get(), calls);
             for (const auto& [callee, location] : calls) {
                 if (isBuiltinFunction(callee)) continue;
-                if (functions_.find(callee) == functions_.end()) fail(location, "未定义的函数: " + callee);
-                if (callee == "main_loop") fail(location, "不能显式调用 main_loop");
-                graph[function.name].push_back(callee);
+                std::string resolved = callee;
+                if (!function.memberOf.empty()) {
+                    const auto owner = memberFunctions_.find(function.memberOf);
+                    if (owner != memberFunctions_.end()) {
+                        const auto method = owner->second.find(callee);
+                        if (method != owner->second.end()) resolved = method->second;
+                    }
+                }
+                if (functions_.find(resolved) == functions_.end()) fail(location, "未定义的函数: " + callee);
+                if (resolved == "main_loop" || resolved == "main_init") {
+                    fail(location, "不能显式调用 " + resolved);
+                }
+                graph[function.name].push_back(resolved);
             }
+            std::vector<std::pair<std::string, SourceLocation>> memberCalls;
+            collectMemberCalls(function.body.get(), memberCalls);
+            appendMemberCallEdges(memberCalls, graph[function.name]);
         }
         for (const GlobalDecl& global : program_.globals) {
             std::vector<std::pair<std::string, SourceLocation>> calls;
@@ -1894,9 +2671,16 @@ private:
             for (const auto& [callee, location] : calls) {
                 if (isBuiltinFunction(callee)) continue;
                 if (functions_.find(callee) == functions_.end()) fail(location, "未定义的函数: " + callee);
-                if (callee == "main_loop") fail(location, "不能显式调用 main_loop");
+                if (callee == "main_loop" || callee == "main_init") {
+                    fail(location, "不能显式调用 " + callee);
+                }
                 initializationRoots.push_back(callee);
             }
+            std::vector<std::pair<std::string, SourceLocation>> memberCalls;
+            collectMemberCalls(global.initializer.get(), memberCalls);
+            std::vector<std::string> edges;
+            appendMemberCallEdges(memberCalls, edges);
+            initializationRoots.insert(initializationRoots.end(), edges.begin(), edges.end());
         }
 
         enum class VisitState { Visiting, Complete };
@@ -1922,10 +2706,11 @@ private:
             for (const std::string& callee : graph[name]) visit(callee);
             stack.pop_back();
             states[name] = VisitState::Complete;
-            if (name != "main_loop") inlineOrder_.push_back(name);
+            if (name != "main_loop" && name != "main_init") inlineOrder_.push_back(name);
         };
 
         visit("main_loop");
+        if (functions_.contains("main_init")) visit("main_init");
         for (const std::string& root : initializationRoots) visit(root);
     }
 
@@ -1971,6 +2756,17 @@ private:
         currentFunction_ = nullptr;
     }
 
+    void generateMainInit() {
+        const FunctionDecl& init = *functions_.at("main_init").declaration;
+        currentFunction_ = &init;
+        currentContext_ = "main_init";
+        pushScope();
+        generateStatement(*init.body);
+        emitter_.label(mainInitEndLabel_);
+        popScope();
+        currentFunction_ = nullptr;
+    }
+
     void generateMainLoop() {
         const FunctionDecl& main = *functions_.at("main_loop").declaration;
         currentFunction_ = &main;
@@ -1993,13 +2789,61 @@ private:
         if (statement.kind == Stmt::Kind::If && statement.elseBranch) {
             return definitelyReturns(*statement.thenBranch) && definitelyReturns(*statement.elseBranch);
         }
+        if (statement.kind == Stmt::Kind::Switch) return switchDefinitelyReturns(statement);
         return false;
+    }
+
+    static bool containsSwitchEscape(const Stmt& statement) {
+        if (statement.kind == Stmt::Kind::Break || statement.kind == Stmt::Kind::Continue) {
+            return true;
+        }
+        if (statement.kind == Stmt::Kind::While || statement.kind == Stmt::Kind::For ||
+            statement.kind == Stmt::Kind::Switch) {
+            return false;
+        }
+        if (statement.kind == Stmt::Kind::Block) {
+            return std::any_of(statement.statements.begin(), statement.statements.end(),
+                               [](const auto& child) { return containsSwitchEscape(*child); });
+        }
+        if (statement.kind == Stmt::Kind::If) {
+            return containsSwitchEscape(*statement.thenBranch) ||
+                   (statement.elseBranch && containsSwitchEscape(*statement.elseBranch));
+        }
+        return false;
+    }
+
+    static bool switchDefinitelyReturns(const Stmt& statement) {
+        const bool hasDefault = std::any_of(
+            statement.switchClauses.begin(), statement.switchClauses.end(),
+            [](const Stmt::SwitchClause& clause) { return !clause.value.has_value(); });
+        if (!hasDefault) return false;
+
+        bool followingReturns = false;
+        for (std::size_t index = statement.switchClauses.size(); index-- > 0;) {
+            bool currentReturns = followingReturns;
+            for (const auto& child : statement.switchClauses[index].statements) {
+                if (containsSwitchEscape(*child)) {
+                    currentReturns = false;
+                    break;
+                }
+                if (definitelyReturns(*child)) {
+                    currentReturns = true;
+                    break;
+                }
+            }
+            if (!currentReturns) return false;
+            followingReturns = true;
+        }
+        return !statement.switchClauses.empty();
     }
 
     void pushScope() { scopes_.emplace_back(); }
     void popScope() { scopes_.pop_back(); }
 
     void declareLocal(const std::string& name, Symbol symbol, SourceLocation location) {
+        if (isReservedBuiltinConstant(name)) {
+            fail(location, "内置常量名称不能被声明: " + name);
+        }
         if (implicitLinkType(name)) {
             fail(location, "Mindustry 链接标识符不能被声明: " + name);
         }
@@ -2009,9 +2853,48 @@ private:
     }
 
     Symbol resolve(const std::string& name, SourceLocation location) const {
+        if (!name.empty() && name.front() == '@') {
+            if (const std::optional<Type> type = builtinContentConstantType(name)) {
+                return {*type, name, false, {}};
+            }
+            fail(location, "未知或暂不支持的 Mindustry @ 常量: " + name);
+        }
+        if (const std::optional<RadarConstant> radar = builtinRadarConstant(name)) {
+            return {radar->type, std::string(radar->operand), false, {}};
+        }
+        if (const std::optional<int> rotation = builtinBuildRotation(name)) {
+            return {TypeKind::Int, std::to_string(*rotation), false, {}};
+        }
         for (auto iterator = scopes_.rbegin(); iterator != scopes_.rend(); ++iterator) {
             const auto symbol = iterator->find(name);
             if (symbol != iterator->end()) return symbol->second;
+        }
+        if (currentFunction_ != nullptr && !currentFunction_->memberOf.empty()) {
+            const StructDecl& declaration = *structs_.at(currentFunction_->memberOf);
+            const Symbol* thisSymbol = nullptr;
+            for (auto iterator = scopes_.rbegin(); iterator != scopes_.rend(); ++iterator) {
+                const auto found = iterator->find("__this");
+                if (found != iterator->end()) {
+                    thisSymbol = &found->second;
+                    break;
+                }
+            }
+            if (thisSymbol != nullptr) {
+                std::size_t offset = 0;
+                for (const StructField& field : declaration.fields) {
+                    const std::size_t fieldSize = typeSize(field.type);
+                    if (field.name == name) {
+                        std::vector<std::string> components(
+                            thisSymbol->components.begin() + static_cast<std::ptrdiff_t>(offset),
+                            thisSymbol->components.begin() + static_cast<std::ptrdiff_t>(offset + fieldSize));
+                        if (field.type.isRuntimeAggregate()) {
+                            return {field.type, "", true, std::move(components)};
+                        }
+                        return {field.type, components.front(), true, {}};
+                    }
+                    offset += fieldSize;
+                }
+            }
         }
         if (const std::optional<Type> type = implicitLinkType(name)) {
             return {*type, name, false, {}};
@@ -2019,8 +2902,36 @@ private:
         fail(location, "未定义的变量: " + name);
     }
 
+    std::optional<std::string> memberFunctionName(const Type& receiver,
+                                                   std::string_view name) const {
+        if (!receiver.isStruct()) return std::nullopt;
+        const auto owner = memberFunctions_.find(receiver.structName);
+        if (owner == memberFunctions_.end()) return std::nullopt;
+        const auto method = owner->second.find(std::string(name));
+        return method == owner->second.end() ? std::nullopt
+                                             : std::optional<std::string>(method->second);
+    }
+
+    std::optional<std::string> currentMemberFunctionName(std::string_view name) const {
+        if (currentFunction_ == nullptr || currentFunction_->memberOf.empty()) return std::nullopt;
+        return memberFunctionName(Type(currentFunction_->memberOf), name);
+    }
+
     static bool canAssign(const Type& destination, const Type& source) {
         if (destination == source) return true;
+        if (source == TypeKind::Null) {
+            return destination == TypeKind::String || destination == TypeKind::Message ||
+                   destination == TypeKind::Building || destination == TypeKind::Posc ||
+                   destination == TypeKind::Unit ||
+                   destination == TypeKind::Display || destination == TypeKind::Memory ||
+                   destination == TypeKind::Item || destination == TypeKind::Liquid ||
+                   destination == TypeKind::Block || destination == TypeKind::UnitKind ||
+                   destination == TypeKind::Team || destination == TypeKind::SensorValue;
+        }
+        if (destination == TypeKind::Posc &&
+            (source == TypeKind::Building || source == TypeKind::Unit ||
+             source == TypeKind::Message ||
+             source == TypeKind::Display || source == TypeKind::Memory)) return true;
         if (destination == TypeKind::Number && isNumeric(source)) return true;
         if (destination == TypeKind::Float && (source == TypeKind::Int || source == TypeKind::Number)) return true;
         return false;
@@ -2094,6 +3005,38 @@ private:
         return addressAdd(base, scaled);
     }
 
+    static std::optional<long long> integerOperand(const std::string& operand) {
+        long long value = 0;
+        const auto [end, error] = std::from_chars(operand.data(), operand.data() + operand.size(), value);
+        if (error != std::errc{} || end != operand.data() + operand.size()) return std::nullopt;
+        return value;
+    }
+
+    ExpressionResult::MemoryLocation normalizedMemoryLocation(const std::string& handle,
+                                                               const std::string& base,
+                                                               const std::string& index,
+                                                               std::size_t elementSize,
+                                                               const std::string& address) const {
+        ExpressionResult::MemoryLocation location;
+        location.handle = handle;
+        location.address = address;
+        location.identityHandle = handle;
+        location.identityBase = base;
+        location.normalized = true;
+        if (const std::optional<long long> constant = integerOperand(index)) {
+            if (*constant > std::numeric_limits<long long>::max() / static_cast<long long>(elementSize) ||
+                *constant < std::numeric_limits<long long>::min() / static_cast<long long>(elementSize)) {
+                location.normalized = false;
+            } else {
+                location.constantOffset = *constant * static_cast<long long>(elementSize);
+            }
+        } else {
+            location.identityIndex = index;
+            location.indexScale = static_cast<long long>(elementSize);
+        }
+        return location;
+    }
+
     ExpressionResult generateIndex(const Expr& expression) {
         const ExpressionResult object = generateExpression(*expression.left);
         const ExpressionResult index = generateExpression(*expression.right);
@@ -2102,7 +3045,8 @@ private:
             const std::string address = index.operand;
             const std::string result = temporary();
             emitter_.emit("read", {result, object.operand, address});
-            return {TypeKind::Number, result, true, {}, ExpressionResult::MemoryLocation{object.operand, address}};
+            return {TypeKind::Number, result, true, {},
+                    normalizedMemoryLocation(object.operand, "0", index.operand, 1, address)};
         }
         if (object.type != TypeKind::Arr && object.type != TypeKind::Arr2d) {
             fail(expression.location, "索引左侧必须是 memory、arr<T> 或 arr2d<T>");
@@ -2131,9 +3075,11 @@ private:
             values.push_back(result);
         }
         if (elementType.isRuntimeAggregate()) {
-            return {elementType, "", true, std::move(values), ExpressionResult::MemoryLocation{handle, address}};
+            return {elementType, "", true, std::move(values),
+                    normalizedMemoryLocation(handle, object.components[1], index.operand, size, address)};
         }
-        return {elementType, values.front(), true, {}, ExpressionResult::MemoryLocation{handle, address}};
+        return {elementType, values.front(), true, {},
+                normalizedMemoryLocation(handle, object.components[1], index.operand, size, address)};
     }
 
     void storeMemory(const ExpressionResult& destination, const ExpressionResult& source) {
@@ -2225,6 +3171,9 @@ private:
             case Stmt::Kind::If:
                 generateIf(statement);
                 break;
+            case Stmt::Kind::Switch:
+                generateSwitch(statement);
+                break;
             case Stmt::Kind::While:
                 generateWhile(statement);
                 break;
@@ -2232,7 +3181,7 @@ private:
                 generateFor(statement);
                 break;
             case Stmt::Kind::Break:
-                if (breakLabels_.empty()) fail(statement.location, "break 只能出现在循环中");
+                if (breakLabels_.empty()) fail(statement.location, "break 只能出现在循环或 switch 中");
                 emitter_.emit("jump", {reference(breakLabels_.back()), "always", "0", "0"});
                 break;
             case Stmt::Kind::Continue:
@@ -2248,8 +3197,27 @@ private:
     void generateIf(const Stmt& statement) {
         const std::string elseLabel = uniqueLabel("else");
         const std::string endLabel = uniqueLabel("if_end");
-        const ExpressionResult condition = toBoolean(generateExpression(*statement.condition), statement.location);
-        emitter_.emit("jump", {reference(elseLabel), "equal", condition.operand, "false"});
+        if (tryGenerateComparisonJump(*statement.condition, elseLabel, false)) {
+            generateStatement(*statement.thenBranch);
+            if (statement.elseBranch) {
+                emitter_.emit("jump", {reference(endLabel), "always", "0", "0"});
+                emitter_.label(elseLabel);
+                generateStatement(*statement.elseBranch);
+                emitter_.label(endLabel);
+            } else {
+                emitter_.label(elseLabel);
+            }
+            return;
+        }
+        if (statement.elseBranch && tryGenerateComparisonJump(*statement.condition, elseLabel, true)) {
+            generateStatement(*statement.elseBranch);
+            emitter_.emit("jump", {reference(endLabel), "always", "0", "0"});
+            emitter_.label(elseLabel);
+            generateStatement(*statement.thenBranch);
+            emitter_.label(endLabel);
+            return;
+        }
+        generateJumpWhenFalse(*statement.condition, elseLabel, statement.location);
         generateStatement(*statement.thenBranch);
         if (statement.elseBranch) {
             emitter_.emit("jump", {reference(endLabel), "always", "0", "0"});
@@ -2261,12 +3229,105 @@ private:
         }
     }
 
+    void generateSwitch(const Stmt& statement) {
+        const ExpressionResult selector = generateExpression(*statement.condition);
+        if (selector.type != TypeKind::Int) {
+            fail(statement.condition->location,
+                 "switch 条件必须是 int，实际为 " + typeName(selector.type));
+        }
+
+        const std::string endLabel = uniqueLabel("switch_end");
+        std::vector<std::string> clauseLabels;
+        clauseLabels.reserve(statement.switchClauses.size());
+        std::optional<std::size_t> defaultClause;
+        std::vector<std::pair<long long, std::size_t>> cases;
+        for (std::size_t index = 0; index < statement.switchClauses.size(); ++index) {
+            clauseLabels.push_back(uniqueLabel("switch_case"));
+            if (statement.switchClauses[index].value) {
+                cases.emplace_back(*statement.switchClauses[index].value, index);
+            } else {
+                defaultClause = index;
+            }
+        }
+        const std::string unmatchedLabel = defaultClause ? clauseLabels[*defaultClause] : endLabel;
+
+        bool useJumpTable = false;
+        long long minimum = 0;
+        long long maximum = 0;
+        std::size_t tableSize = 0;
+        if (cases.size() >= 4) {
+            minimum = cases.front().first;
+            maximum = cases.front().first;
+            for (const auto& [value, clause] : cases) {
+                (void)clause;
+                minimum = std::min(minimum, value);
+                maximum = std::max(maximum, value);
+            }
+            const long double span = static_cast<long double>(maximum) -
+                                     static_cast<long double>(minimum) + 1.0L;
+            if (span <= 64.0L && span <= static_cast<long double>(cases.size() * 2)) {
+                useJumpTable = true;
+                tableSize = static_cast<std::size_t>(span);
+            }
+        }
+
+        if (useJumpTable) {
+            emitter_.emit("jump", {reference(unmatchedLabel), "lessThan", selector.operand,
+                                    std::to_string(minimum)});
+            emitter_.emit("jump", {reference(unmatchedLabel), "greaterThan", selector.operand,
+                                    std::to_string(maximum)});
+            std::string tableIndex = selector.operand;
+            if (minimum != 0) {
+                tableIndex = temporary();
+                emitter_.emit("op", {"sub", tableIndex, selector.operand,
+                                     std::to_string(minimum)});
+            }
+            const std::string tableLabel = uniqueLabel("switch_table");
+            const std::string target = temporary();
+            emitter_.emit("op", {"add", target, tableIndex, reference(tableLabel)});
+            std::vector<std::string> possibleTargets = clauseLabels;
+            if (std::find(possibleTargets.begin(), possibleTargets.end(), unmatchedLabel) ==
+                possibleTargets.end()) {
+                possibleTargets.push_back(unmatchedLabel);
+            }
+            emitter_.emitCounterJump(target, std::move(possibleTargets));
+            emitter_.label(tableLabel);
+
+            std::unordered_map<long long, std::size_t> clauseByValue;
+            for (const auto& [value, clause] : cases) clauseByValue.emplace(value, clause);
+            for (std::size_t offset = 0; offset < tableSize; ++offset) {
+                const long long value = minimum + static_cast<long long>(offset);
+                const auto clause = clauseByValue.find(value);
+                const std::string& targetLabel = clause == clauseByValue.end()
+                    ? unmatchedLabel : clauseLabels[clause->second];
+                emitter_.emit("jump", {reference(targetLabel), "always", "0", "0"});
+            }
+        } else {
+            for (const auto& [value, clause] : cases) {
+                emitter_.emit("jump", {reference(clauseLabels[clause]), "equal",
+                                        selector.operand, std::to_string(value)});
+            }
+            emitter_.emit("jump", {reference(unmatchedLabel), "always", "0", "0"});
+        }
+
+        breakLabels_.push_back(endLabel);
+        for (std::size_t index = 0; index < statement.switchClauses.size(); ++index) {
+            emitter_.label(clauseLabels[index]);
+            pushScope();
+            for (const auto& child : statement.switchClauses[index].statements) {
+                generateStatement(*child);
+            }
+            popScope();
+        }
+        breakLabels_.pop_back();
+        emitter_.label(endLabel);
+    }
+
     void generateWhile(const Stmt& statement) {
         const std::string conditionLabel = uniqueLabel("while_condition");
         const std::string endLabel = uniqueLabel("while_end");
         emitter_.label(conditionLabel);
-        const ExpressionResult condition = toBoolean(generateExpression(*statement.condition), statement.location);
-        emitter_.emit("jump", {reference(endLabel), "equal", condition.operand, "false"});
+        generateJumpWhenFalse(*statement.condition, endLabel, statement.location);
         breakLabels_.push_back(endLabel);
         continueLabels_.push_back(conditionLabel);
         generateStatement(*statement.thenBranch);
@@ -2284,8 +3345,7 @@ private:
         const std::string endLabel = uniqueLabel("for_end");
         emitter_.label(conditionLabel);
         if (statement.condition) {
-            const ExpressionResult condition = toBoolean(generateExpression(*statement.condition), statement.location);
-            emitter_.emit("jump", {reference(endLabel), "equal", condition.operand, "false"});
+            generateJumpWhenFalse(*statement.condition, endLabel, statement.location);
         }
         breakLabels_.push_back(endLabel);
         continueLabels_.push_back(incrementLabel);
@@ -2299,11 +3359,59 @@ private:
         popScope();
     }
 
+    bool tryGenerateComparisonJump(const Expr& expression, const std::string& target,
+                                   bool jumpWhenTrue) {
+        if (expression.kind != Expr::Kind::Binary) return false;
+        const Type leftType = expressionType(*expression.left);
+        const Type rightType = expressionType(*expression.right);
+        const bool nullComparison = leftType == TypeKind::Null || rightType == TypeKind::Null;
+        std::string condition;
+        if (nullComparison) {
+            if ((jumpWhenTrue && expression.text != "==") ||
+                (!jumpWhenTrue && expression.text != "!=")) return false;
+            condition = "strictEqual";
+        } else if (jumpWhenTrue) {
+            static const std::unordered_map<std::string, std::string> directConditions = {
+                {"==", "equal"}, {"<", "lessThan"}, {"<=", "lessThanEq"},
+                {">", "greaterThan"}, {">=", "greaterThanEq"},
+            };
+            const auto direct = directConditions.find(expression.text);
+            if (direct == directConditions.end()) return false;
+            condition = direct->second;
+        } else {
+            if (expression.text != "!=") return false;
+            condition = "equal";
+        }
+
+        (void)expressionType(expression);
+        const ExpressionResult left = generateExpression(*expression.left);
+        const ExpressionResult right = generateExpression(*expression.right);
+        emitter_.emit("jump", {reference(target), condition, left.operand, right.operand});
+        return true;
+    }
+
+    void generateJumpWhenFalse(const Expr& expression, const std::string& target,
+                               SourceLocation location) {
+        if (tryGenerateComparisonJump(expression, target, false)) return;
+        const ExpressionResult condition = generateExpression(expression);
+        if (condition.type == TypeKind::Bool) {
+            emitter_.emit("jump", {reference(target), "equal", condition.operand, "false"});
+            return;
+        }
+        if (!isNumeric(condition.type)) fail(location, "条件需要 bool 或数值类型");
+        emitter_.emit("jump", {reference(target), "equal", condition.operand, "0"});
+    }
+
     void generateReturn(const Stmt& statement) {
         if (currentFunction_ == nullptr) fail(statement.location, "return 不在函数内");
         if (currentFunction_->name == "main_loop") {
             if (statement.expression) fail(statement.location, "main_loop 不能返回值");
             emitter_.emit("jump", {reference(mainEntryLabel_), "always", "0", "0"});
+            return;
+        }
+        if (currentFunction_->name == "main_init") {
+            if (statement.expression) fail(statement.location, "main_init 不能返回值");
+            emitter_.emit("jump", {reference(mainInitEndLabel_), "always", "0", "0"});
             return;
         }
 
@@ -2336,6 +3444,8 @@ private:
                 return {TypeKind::String, escapeString(expression.text), false};
             case Expr::Kind::Boolean:
                 return {TypeKind::Bool, expression.boolean ? "true" : "false", false};
+            case Expr::Kind::Null:
+                return {TypeKind::Null, "null", false};
             case Expr::Kind::Variable: {
                 const Symbol symbol = resolve(expression.text, expression.location);
                 return fromSymbol(symbol);
@@ -2344,6 +3454,8 @@ private:
                 return generateUnary(expression);
             case Expr::Kind::Binary:
                 return generateBinary(expression);
+            case Expr::Kind::Conditional:
+                return generateConditional(expression);
             case Expr::Kind::Assign:
                 return generateAssignment(expression);
             case Expr::Kind::Call:
@@ -2424,7 +3536,8 @@ private:
             const Type& left = argumentTypes[0];
             const Type& right = argumentTypes[1];
             if (left.isStruct() || right.isStruct() ||
-                (left != right && !(isNumeric(left) && isNumeric(right)))) {
+                (left != TypeKind::Null && right != TypeKind::Null &&
+                 left != right && !(isNumeric(left) && isNumeric(right)))) {
                 fail(expression.location, "strict_equal 参数类型不兼容");
             }
             return TypeKind::Bool;
@@ -2451,12 +3564,155 @@ private:
         return TypeKind::Number;
     }
 
+    std::size_t unitCoordinateOffset(const Expr& expression, std::size_t scalarCount,
+                                     std::size_t pointCount) const {
+        if (expression.arguments.size() == pointCount &&
+            expressionType(*expression.arguments[0]) == Type("point")) {
+            return 1;
+        }
+        if (expression.arguments.size() == scalarCount) {
+            if (!isNumeric(expressionType(*expression.arguments[0])) ||
+                !isNumeric(expressionType(*expression.arguments[1]))) {
+                fail(expression.location, expression.text + " 的坐标必须是数值或 point");
+            }
+            return 2;
+        }
+        fail(expression.location, expression.text + " 参数数量错误");
+    }
+
+    Type unitMemberType(const Expr& expression) const {
+        const auto requireNone = [&] {
+            if (!expression.arguments.empty()) fail(expression.location, expression.text + " 不需要参数");
+        };
+        const auto requireNumeric = [&](std::size_t index) {
+            if (!isNumeric(expressionType(*expression.arguments[index]))) {
+                fail(expression.arguments[index]->location, expression.text + " 参数必须是数值类型");
+            }
+        };
+        const auto requireBoolean = [&](std::size_t index) {
+            const Type type = expressionType(*expression.arguments[index]);
+            if (type != TypeKind::Bool && !isNumeric(type)) {
+                fail(expression.arguments[index]->location, expression.text + " 参数必须是 bool 或数值类型");
+            }
+        };
+
+        if (expression.text == "idle" || expression.text == "stop" ||
+            expression.text == "auto_pathfind" || expression.text == "payload_drop" ||
+            expression.text == "payload_enter" || expression.text == "unbind") {
+            requireNone();
+            return TypeKind::Void;
+        }
+        if (expression.text == "move" || expression.text == "pathfind" ||
+            expression.text == "mine" || expression.text == "deconstruct") {
+            (void)unitCoordinateOffset(expression, 2, 1);
+            return TypeKind::Void;
+        }
+        if (expression.text == "approach" || expression.text == "within") {
+            const std::size_t offset = unitCoordinateOffset(expression, 3, 2);
+            requireNumeric(offset);
+            return expression.text == "within" ? Type(TypeKind::Bool) : Type(TypeKind::Void);
+        }
+        if (expression.text == "boost" || expression.text == "payload_take") {
+            if (expression.arguments.size() != 1) fail(expression.location, expression.text + " 需要一个参数");
+            requireBoolean(0);
+            return TypeKind::Void;
+        }
+        if (expression.text == "target") {
+            const std::size_t offset = unitCoordinateOffset(expression, 3, 2);
+            requireBoolean(offset);
+            return TypeKind::Void;
+        }
+        if (expression.text == "targetp") {
+            if (expression.arguments.size() != 2) fail(expression.location, "targetp 需要目标和开火状态");
+            requireAssignable(TypeKind::Posc, expressionType(*expression.arguments[0]),
+                              expression.arguments[0]->location);
+            requireBoolean(1);
+            return TypeKind::Void;
+        }
+        if (expression.text == "item_drop") {
+            if (expression.arguments.size() != 2 ||
+                expressionType(*expression.arguments[0]) != TypeKind::Building ||
+                expressionType(*expression.arguments[1]) != TypeKind::Int) {
+                fail(expression.location, "item_drop 需要 building 和 int 参数");
+            }
+            return TypeKind::Void;
+        }
+        if (expression.text == "discard_items") {
+            if (expression.arguments.size() != 1 ||
+                expressionType(*expression.arguments[0]) != TypeKind::Int) {
+                fail(expression.location, "discard_items 需要一个 int 参数");
+            }
+            return TypeKind::Void;
+        }
+        if (expression.text == "item_take") {
+            if (expression.arguments.size() != 3 ||
+                expressionType(*expression.arguments[0]) != TypeKind::Building ||
+                expressionType(*expression.arguments[1]) != TypeKind::Item ||
+                expressionType(*expression.arguments[2]) != TypeKind::Int) {
+                fail(expression.location, "item_take 需要 building、item 和 int 参数");
+            }
+            return TypeKind::Void;
+        }
+        if (expression.text == "set_flag") {
+            if (expression.arguments.size() != 1) fail(expression.location, "set_flag 需要一个参数");
+            requireNumeric(0);
+            return TypeKind::Void;
+        }
+        if (expression.text == "build") {
+            const bool pointForm = !expression.arguments.empty() &&
+                                   expressionType(*expression.arguments[0]) == Type("point");
+            const std::size_t offset = pointForm ? 1 : 2;
+            const std::size_t minimum = pointForm ? 3 : 4;
+            if (expression.arguments.size() != minimum && expression.arguments.size() != minimum + 1) {
+                fail(expression.location, "build 需要坐标、block、旋转和可选配置");
+            }
+            if (!pointForm) {
+                requireNumeric(0);
+                requireNumeric(1);
+            }
+            if (expressionType(*expression.arguments[offset]) != TypeKind::Block) {
+                fail(expression.arguments[offset]->location, "build 方块参数必须是 block");
+            }
+            if (!isNumeric(expressionType(*expression.arguments[offset + 1]))) {
+                fail(expression.arguments[offset + 1]->location, "build 旋转参数必须是数值类型");
+            }
+            if (expression.arguments.size() == minimum + 1) {
+                const Type config = expressionType(*expression.arguments[offset + 2]);
+                const bool valid = config == TypeKind::Null || config == TypeKind::Bool || isNumeric(config) ||
+                                   config == TypeKind::Building || config == TypeKind::Block ||
+                                   config == TypeKind::UnitKind || config == TypeKind::Item ||
+                                   config == TypeKind::Liquid || config == TypeKind::SensorValue;
+                if (!valid) fail(expression.arguments[offset + 2]->location, "build 配置参数类型不受支持");
+            }
+            return TypeKind::Void;
+        }
+        if (expression.text == "get_block") {
+            const std::size_t offset = unitCoordinateOffset(expression, 5, 4);
+            const std::array<Type, 3> outputs = {TypeKind::Block, TypeKind::Building, TypeKind::Block};
+            for (std::size_t index = 0; index < outputs.size(); ++index) {
+                if (expressionType(*expression.arguments[offset + index]) != outputs[index]) {
+                    fail(expression.arguments[offset + index]->location,
+                         "get_block 输出参数类型必须依次为 block、building、block");
+                }
+            }
+            return TypeKind::Void;
+        }
+        if (expression.text == "get_block_type" || expression.text == "get_block_building" ||
+            expression.text == "get_block_floor") {
+            (void)unitCoordinateOffset(expression, 2, 1);
+            return expression.text == "get_block_building" ? Type(TypeKind::Building)
+                                                             : Type(TypeKind::Block);
+        }
+        fail(expression.location, "未知的 unit 成员函数: " + expression.text);
+    }
+
     Type expressionType(const Expr& expression) const {
         switch (expression.kind) {
             case Expr::Kind::Number:
                 return expression.text.find_first_of(".eE") == std::string::npos ? TypeKind::Int : TypeKind::Number;
             case Expr::Kind::String: return TypeKind::String;
             case Expr::Kind::Boolean: return TypeKind::Bool;
+            case Expr::Kind::Null: return TypeKind::Null;
             case Expr::Kind::Variable: return resolve(expression.text, expression.location).type;
             case Expr::Kind::Unary: {
                 const Type operand = expressionType(*expression.right);
@@ -2495,7 +3751,8 @@ private:
                 }
                 if (expression.text == "==" || expression.text == "!=") {
                     if (left.isStruct() || right.isStruct()) fail(expression.location, "结构体暂不支持比较运算");
-                    if (left != right && !(isNumeric(left) && isNumeric(right))) {
+                    const bool nullComparison = left == TypeKind::Null || right == TypeKind::Null;
+                    if (!nullComparison && left != right && !(isNumeric(left) && isNumeric(right))) {
                         fail(expression.location, "不能比较 " + typeName(left) + " 和 " + typeName(right));
                     }
                     return TypeKind::Bool;
@@ -2509,6 +3766,24 @@ private:
                     fail(expression.location, "% 只接受 int 操作数");
                 }
                 return commonNumericType(left, right, expression.text);
+            }
+            case Expr::Kind::Conditional: {
+                const Type condition = expressionType(*expression.left);
+                if (condition != TypeKind::Bool && !isNumeric(condition)) {
+                    fail(expression.left->location, "三目运算符条件需要 bool 或数值类型");
+                }
+                const Type trueType = expressionType(*expression.right);
+                const Type falseType = expressionType(*expression.third);
+                if (trueType == TypeKind::Void || falseType == TypeKind::Void) {
+                    if (trueType == TypeKind::Void && falseType == TypeKind::Void) {
+                        return TypeKind::Void;
+                    }
+                    fail(expression.location, "三目运算符两支必须同时为 void 或同时产生值");
+                }
+                if (isRadarSelector(trueType) || isRadarSelector(falseType)) {
+                    fail(expression.location, "Radar 编译期选择器不能作为三目运算符结果");
+                }
+                return conditionalCommonType(trueType, falseType, expression.location);
             }
             case Expr::Kind::Assign: {
                 const Type destination = expressionType(*expression.left);
@@ -2559,6 +3834,102 @@ private:
             case Expr::Kind::Call: {
                 if (expression.receiver) {
                     const Type receiverType = expressionType(*expression.receiver);
+                    if (const std::optional<std::string> member =
+                            memberFunctionName(receiverType, expression.text)) {
+                        const FunctionDecl& declaration = *functions_.at(*member).declaration;
+                        if (expression.arguments.size() + 1 != declaration.parameters.size()) {
+                            fail(expression.location, "成员函数 " + receiverType.structName + "." +
+                                                      expression.text + " 参数数量错误");
+                        }
+                        if (!expression.receiver || expression.receiver->kind == Expr::Kind::InitializerList) {
+                            fail(expression.location, "成员函数接收者需要可赋值左值");
+                        }
+                        for (std::size_t index = 0; index < expression.arguments.size(); ++index) {
+                            const Parameter& parameter = declaration.parameters[index + 1];
+                            if (parameter.reference) {
+                                const Type argumentType = expressionType(*expression.arguments[index]);
+                                if (argumentType != parameter.type) {
+                                    fail(expression.arguments[index]->location,
+                                         "引用参数类型必须精确匹配 " + typeName(parameter.type));
+                                }
+                            } else if (expression.arguments[index]->kind != Expr::Kind::InitializerList) {
+                                requireAssignable(parameter.type,
+                                                  expressionType(*expression.arguments[index]),
+                                                  expression.arguments[index]->location);
+                            }
+                        }
+                        return declaration.returnType;
+                    }
+                    if (expression.text == "get") {
+                        if (!isSenseableReceiver(receiverType)) {
+                            fail(expression.location, "get 的接收者不支持 sensor");
+                        }
+                        if (expression.arguments.size() != 1) {
+                            fail(expression.location, "get 需要一个 sensor 或内容常量参数");
+                        }
+                        const Expr& selector = *expression.arguments[0];
+                        const Type selectorType = expressionType(selector);
+                        if (selectorType == TypeKind::Sensor) {
+                            if (selector.kind != Expr::Kind::Variable || selector.text.empty() ||
+                                selector.text.front() != '@' ||
+                                !isSenseableSensorName(std::string_view(selector.text).substr(1))) {
+                                fail(selector.location, "get 的 sensor 参数必须是可感知的内置 @ 常量");
+                            }
+                            return *sensorResultType(std::string_view(selector.text).substr(1), receiverType);
+                        }
+                        if (selectorType == TypeKind::Item || selectorType == TypeKind::Liquid ||
+                            selectorType == TypeKind::Block || selectorType == TypeKind::UnitKind) {
+                            return TypeKind::Number;
+                        }
+                        fail(selector.location, "get 参数必须是 sensor、item、liquid、block 或 unit_kind 常量");
+                    }
+                    if (const std::optional<std::string_view> sensor = sensorAlias(expression.text)) {
+                        if (!isSenseableReceiver(receiverType)) {
+                            fail(expression.location, expression.text + " 的接收者不支持 sensor");
+                        }
+                        if (!expression.arguments.empty()) {
+                            fail(expression.location, expression.text + " 不需要参数");
+                        }
+                        return *sensorResultType(*sensor, receiverType);
+                    }
+                    if (receiverType == TypeKind::Unit) return unitMemberType(expression);
+                    if (expression.text == "radar" || builtinRadarMethod(expression.text)) {
+                        if (receiverType != TypeKind::Building) {
+                            fail(expression.location, "Radar 的接收者必须是 building");
+                        }
+                        const std::optional<RadarMethod> method = builtinRadarMethod(expression.text);
+                        if (!method && expression.arguments.size() < 2) {
+                            fail(expression.location, "radar 需要 radar_sort 和 int order 参数");
+                        }
+                        const std::size_t filterCount = method
+                            ? expression.arguments.size()
+                            : expression.arguments.size() >= 2 ? expression.arguments.size() - 2 : 4;
+                        if (filterCount > 3) {
+                            fail(expression.location, expression.text + " 最多接受三个 Radar 筛选条件");
+                        }
+                        for (std::size_t index = 0; index < filterCount; ++index) {
+                            const Expr& argument = *expression.arguments[index];
+                            const std::optional<RadarConstant> selector =
+                                argument.kind == Expr::Kind::Variable
+                                    ? builtinRadarConstant(argument.text) : std::nullopt;
+                            if (!selector || selector->type != TypeKind::RadarFilter) {
+                                fail(argument.location, "Radar 筛选条件必须是内置 radar_filter 常量");
+                            }
+                        }
+                        if (!method) {
+                            const Expr& sort = *expression.arguments[filterCount];
+                            const std::optional<RadarConstant> selector =
+                                sort.kind == Expr::Kind::Variable
+                                    ? builtinRadarConstant(sort.text) : std::nullopt;
+                            if (!selector || selector->type != TypeKind::RadarSort) {
+                                fail(sort.location, "Radar 排序必须是内置 radar_sort 常量");
+                            }
+                            if (expressionType(*expression.arguments.back()) != TypeKind::Int) {
+                                fail(expression.arguments.back()->location, "Radar order 必须是 int");
+                            }
+                        }
+                        return TypeKind::Unit;
+                    }
                     if (receiverType != TypeKind::Building) {
                         fail(expression.location, "内置成员函数的接收者必须是 building");
                     }
@@ -2572,13 +3943,102 @@ private:
                         }
                         return TypeKind::Void;
                     }
-                    if (expression.text == "get_enabled") {
-                        if (!expression.arguments.empty()) {
-                            fail(expression.location, "get_enabled 不需要参数");
+                    if (expression.text == "shoot") {
+                        if (expression.arguments.size() != 2) {
+                            fail(expression.location, "shoot 需要 point 和开火状态两个参数");
                         }
-                        return TypeKind::Bool;
+                        if (expressionType(*expression.arguments[0]) != Type("point")) {
+                            fail(expression.arguments[0]->location, "shoot 的目标必须是 point");
+                        }
+                        const Type enabled = expressionType(*expression.arguments[1]);
+                        if (enabled != TypeKind::Bool && !isNumeric(enabled)) {
+                            fail(expression.arguments[1]->location, "shoot 的开火状态必须是 bool 或数值类型");
+                        }
+                        return TypeKind::Void;
+                    }
+                    if (expression.text == "shootp") {
+                        if (expression.arguments.size() != 2) {
+                            fail(expression.location, "shootp 需要 posc 和开火状态两个参数");
+                        }
+                        requireAssignable(TypeKind::Posc, expressionType(*expression.arguments[0]),
+                                          expression.arguments[0]->location);
+                        const Type enabled = expressionType(*expression.arguments[1]);
+                        if (enabled != TypeKind::Bool && !isNumeric(enabled)) {
+                            fail(expression.arguments[1]->location, "shootp 的开火状态必须是 bool 或数值类型");
+                        }
+                        return TypeKind::Void;
+                    }
+                    if (expression.text == "set_color") {
+                        if (expression.arguments.size() != 1 ||
+                            expressionType(*expression.arguments[0]) != TypeKind::PackedColor) {
+                            fail(expression.location, "set_color 需要一个 packed_color 参数");
+                        }
+                        return TypeKind::Void;
+                    }
+                    if (const std::optional<Type> parameter = configValueMemberType(expression.text)) {
+                        if (expression.arguments.size() != 1) {
+                            fail(expression.location, expression.text + " 需要一个 " +
+                                                      typeName(*parameter) + " 参数");
+                        }
+                        requireAssignable(*parameter, expressionType(*expression.arguments[0]),
+                                          expression.arguments[0]->location);
+                        return TypeKind::Void;
+                    }
+                    if (isPayloadKindMember(expression.text)) {
+                        if (expression.arguments.size() != 1) {
+                            fail(expression.location, expression.text + " 需要一个 block 或 unit_kind 参数");
+                        }
+                        const Type argument = expressionType(*expression.arguments[0]);
+                        if (argument != TypeKind::Block && argument != TypeKind::UnitKind) {
+                            fail(expression.arguments[0]->location,
+                                 expression.text + " 参数必须是 block 或 unit_kind");
+                        }
+                        return TypeKind::Void;
+                    }
+                    if (isConfigClearMember(expression.text)) {
+                        if (!expression.arguments.empty()) {
+                            fail(expression.location, expression.text + " 不需要参数");
+                        }
+                        return TypeKind::Void;
+                    }
+                    if (expression.text == "copy_configuration_from") {
+                        if (expression.arguments.size() != 1 ||
+                            expressionType(*expression.arguments[0]) != TypeKind::Building) {
+                            fail(expression.location, "copy_configuration_from 需要一个 building 参数");
+                        }
+                        return TypeKind::Void;
+                    }
+                    if (expression.text == "set_rotation") {
+                        if (expression.arguments.size() != 1 ||
+                            expressionType(*expression.arguments[0]) != TypeKind::Int) {
+                            fail(expression.location, "set_rotation 需要一个 int 参数");
+                        }
+                        return TypeKind::Void;
                     }
                     fail(expression.location, "未知的内置成员函数: " + expression.text);
+                }
+                if (const std::optional<std::string> member =
+                        currentMemberFunctionName(expression.text)) {
+                    const FunctionDecl& declaration = *functions_.at(*member).declaration;
+                    if (expression.arguments.size() + 1 != declaration.parameters.size()) {
+                        fail(expression.location, "成员函数 " + currentFunction_->memberOf + "." +
+                                                  expression.text + " 参数数量错误");
+                    }
+                    for (std::size_t index = 0; index < expression.arguments.size(); ++index) {
+                        const Parameter& parameter = declaration.parameters[index + 1];
+                        if (parameter.reference) {
+                            const Type argumentType = expressionType(*expression.arguments[index]);
+                            if (argumentType != parameter.type) {
+                                fail(expression.arguments[index]->location,
+                                     "引用参数类型必须精确匹配 " + typeName(parameter.type));
+                            }
+                        } else if (expression.arguments[index]->kind != Expr::Kind::InitializerList) {
+                            requireAssignable(parameter.type,
+                                              expressionType(*expression.arguments[index]),
+                                              expression.arguments[index]->location);
+                        }
+                    }
+                    return declaration.returnType;
                 }
                 if (builtinOpFunction(expression.text)) return builtinOpType(expression);
                 if (expression.text == "rgb" || expression.text == "rgba") {
@@ -2632,6 +4092,24 @@ private:
                     }
                     return TypeKind::Building;
                 }
+                if (expression.text == "unit_bind") {
+                    if (expression.arguments.size() != 1) {
+                        fail(expression.location, "unit_bind 需要一个 unit_kind 或 unit 参数");
+                    }
+                    const Type argument = expressionType(*expression.arguments[0]);
+                    if (argument != TypeKind::UnitKind && argument != TypeKind::Unit) {
+                        fail(expression.arguments[0]->location,
+                             "unit_bind 参数必须是 unit_kind 或 unit");
+                    }
+                    return TypeKind::Unit;
+                }
+                if (const std::optional<LookupFunction> lookup = builtinLookupFunction(expression.text)) {
+                    if (expression.arguments.size() != 1 ||
+                        expressionType(*expression.arguments.front()) != TypeKind::Int) {
+                        fail(expression.location, expression.text + " 需要一个 int 参数");
+                    }
+                    return lookup->result;
+                }
                 if (isBuiltinFunction(expression.text)) return TypeKind::Void;
                 const auto function = functions_.find(expression.text);
                 if (function == functions_.end()) fail(expression.location, "未定义的函数: " + expression.text);
@@ -2640,7 +4118,16 @@ private:
                     fail(expression.location, "函数 " + declaration.name + " 参数数量错误");
                 }
                 for (std::size_t index = 0; index < expression.arguments.size(); ++index) {
-                    if (expression.arguments[index]->kind != Expr::Kind::InitializerList) {
+                    if (declaration.parameters[index].reference) {
+                        if (expression.arguments[index]->kind == Expr::Kind::InitializerList) {
+                            fail(expression.arguments[index]->location, "引用参数需要可赋值左值");
+                        }
+                        const Type argumentType = expressionType(*expression.arguments[index]);
+                        if (argumentType != declaration.parameters[index].type) {
+                            fail(expression.arguments[index]->location,
+                                 "引用参数类型必须精确匹配 " + typeName(declaration.parameters[index].type));
+                        }
+                    } else if (expression.arguments[index]->kind != Expr::Kind::InitializerList) {
                         requireAssignable(declaration.parameters[index].type,
                                           expressionType(*expression.arguments[index]),
                                           expression.arguments[index]->location);
@@ -2670,7 +4157,18 @@ private:
                 std::vector<std::string> fieldOperands(objectOperands.begin() + static_cast<std::ptrdiff_t>(offset),
                                                        objectOperands.begin() + static_cast<std::ptrdiff_t>(offset + fieldSize));
                 std::optional<ExpressionResult::MemoryLocation> location = object.memoryLocation;
-                if (location) location->address = addressAdd(location->address, std::to_string(offset));
+                if (location) {
+                    location->address = addressAdd(location->address, std::to_string(offset));
+                    if (location->normalized) {
+                        if (offset > static_cast<std::size_t>(std::numeric_limits<long long>::max()) ||
+                            location->constantOffset > std::numeric_limits<long long>::max() -
+                                                           static_cast<long long>(offset)) {
+                            location->normalized = false;
+                        } else {
+                            location->constantOffset += static_cast<long long>(offset);
+                        }
+                    }
+                }
                 if (field.type.isRuntimeAggregate()) return {field.type, "", object.lvalue, std::move(fieldOperands), location};
                 return {field.type, fieldOperands.front(), object.lvalue, {}, location};
             }
@@ -2713,6 +4211,143 @@ private:
         return TypeKind::Int;
     }
 
+    static Type conditionalCommonType(const Type& trueType, const Type& falseType,
+                                      SourceLocation location) {
+        if (trueType == falseType) return trueType;
+        if (isNumeric(trueType) && isNumeric(falseType)) {
+            return commonNumericType(trueType, falseType, "?:");
+        }
+        if (canAssign(trueType, falseType)) return trueType;
+        if (canAssign(falseType, trueType)) return falseType;
+        fail(location, "三目运算符两支类型不兼容: " + typeName(trueType) + " 和 " +
+                       typeName(falseType));
+    }
+
+    bool isSelectSafe(const Expr& expression) const {
+        switch (expression.kind) {
+            case Expr::Kind::Number:
+            case Expr::Kind::String:
+            case Expr::Kind::Boolean:
+            case Expr::Kind::Null:
+            case Expr::Kind::Variable:
+            case Expr::Kind::Sizeof:
+                return true;
+            case Expr::Kind::Unary:
+                return isSelectSafe(*expression.right);
+            case Expr::Kind::Binary:
+                return isSelectSafe(*expression.left) && isSelectSafe(*expression.right);
+            case Expr::Kind::Conditional:
+                return isSelectSafe(*expression.left) && isSelectSafe(*expression.right) &&
+                       isSelectSafe(*expression.third);
+            case Expr::Kind::Call: {
+                if (expression.receiver) return false;
+                const bool pureBuiltin =
+                    (builtinOpFunction(expression.text) && expression.text != "rand") ||
+                    expression.text == "dot" || expression.text == "cross" ||
+                    expression.text == "rgb" || expression.text == "rgba" ||
+                    expression.text == "pack_color" || expression.text == "unpack_color";
+                return pureBuiltin &&
+                       std::all_of(expression.arguments.begin(), expression.arguments.end(),
+                                   [&](const auto& argument) { return isSelectSafe(*argument); });
+            }
+            case Expr::Kind::Member:
+                return isSelectSafe(*expression.left);
+            case Expr::Kind::Index:
+                return isSelectSafe(*expression.left) && isSelectSafe(*expression.right);
+            case Expr::Kind::InitializerList:
+            case Expr::Kind::TypedInitializer:
+                return std::all_of(expression.arguments.begin(), expression.arguments.end(),
+                                   [&](const auto& argument) { return isSelectSafe(*argument); });
+            case Expr::Kind::Assign:
+            case Expr::Kind::Prefix:
+            case Expr::Kind::Postfix:
+                return false;
+        }
+        return false;
+    }
+
+    struct SelectCondition {
+        std::string operation;
+        std::string left;
+        std::string right;
+        bool invert = false;
+    };
+
+    SelectCondition generateSelectCondition(const Expr& expression) {
+        if (expression.kind == Expr::Kind::Binary) {
+            static const std::unordered_map<std::string, std::string> operations = {
+                {"==", "equal"}, {"!=", "notEqual"}, {"<", "lessThan"},
+                {"<=", "lessThanEq"}, {">", "greaterThan"}, {">=", "greaterThanEq"},
+            };
+            const auto operation = operations.find(expression.text);
+            if (operation != operations.end()) {
+                (void)expressionType(expression);
+                const ExpressionResult left = generateExpression(*expression.left);
+                const ExpressionResult right = generateExpression(*expression.right);
+                const bool nullComparison = left.type == TypeKind::Null || right.type == TypeKind::Null;
+                if (nullComparison) {
+                    return {"strictEqual", left.operand, right.operand, expression.text == "!="};
+                }
+                return {operation->second, left.operand, right.operand, false};
+            }
+        }
+        const ExpressionResult condition = generateExpression(expression);
+        if (condition.type == TypeKind::Bool) {
+            return {"notEqual", condition.operand, "false", false};
+        }
+        if (!isNumeric(condition.type)) fail(expression.location, "条件需要 bool 或数值类型");
+        return {"notEqual", condition.operand, "0", false};
+    }
+
+    ExpressionResult generateConditional(const Expr& expression) {
+        const Type resultType = expressionType(expression);
+        if (!isSelectSafe(*expression.right) || !isSelectSafe(*expression.third)) {
+            const std::string falseLabel = uniqueLabel("conditional_false");
+            const std::string endLabel = uniqueLabel("conditional_end");
+            std::vector<std::string> results;
+            results.reserve(typeSize(resultType));
+            for (std::size_t index = 0; index < typeSize(resultType); ++index) {
+                results.push_back(temporary());
+            }
+
+            generateJumpWhenFalse(*expression.left, falseLabel, expression.left->location);
+            const ExpressionResult trueValue = generateValue(*expression.right, resultType);
+            const std::vector<std::string> trueOperands = operandsOf(trueValue);
+            for (std::size_t index = 0; index < results.size(); ++index) {
+                emitter_.emit("set", {results[index], trueOperands[index]});
+            }
+            emitter_.emit("jump", {reference(endLabel), "always", "0", "0"});
+
+            emitter_.label(falseLabel);
+            const ExpressionResult falseValue = generateValue(*expression.third, resultType);
+            const std::vector<std::string> falseOperands = operandsOf(falseValue);
+            for (std::size_t index = 0; index < results.size(); ++index) {
+                emitter_.emit("set", {results[index], falseOperands[index]});
+            }
+            emitter_.label(endLabel);
+
+            if (resultType == TypeKind::Void) return {TypeKind::Void, "", false};
+            if (resultType.isRuntimeAggregate()) return {resultType, "", false, std::move(results)};
+            return {resultType, results.front(), false};
+        }
+        const SelectCondition condition = generateSelectCondition(*expression.left);
+        const ExpressionResult trueValue = generateValue(*expression.right, resultType);
+        const ExpressionResult falseValue = generateValue(*expression.third, resultType);
+        const std::vector<std::string> trueOperands = operandsOf(trueValue);
+        const std::vector<std::string> falseOperands = operandsOf(falseValue);
+        std::vector<std::string> results;
+        results.reserve(trueOperands.size());
+        for (std::size_t index = 0; index < trueOperands.size(); ++index) {
+            const std::string result = temporary();
+            emitter_.emit("select", {result, condition.operation, condition.left, condition.right,
+                                     condition.invert ? falseOperands[index] : trueOperands[index],
+                                     condition.invert ? trueOperands[index] : falseOperands[index]});
+            results.push_back(result);
+        }
+        if (resultType.isRuntimeAggregate()) return {resultType, "", false, std::move(results)};
+        return {resultType, results.front(), false};
+    }
+
     ExpressionResult generateBinary(const Expr& expression) {
         if (expression.text == "&&" || expression.text == "||") return generateLogical(expression);
 
@@ -2733,13 +4368,22 @@ private:
                 fail(expression.location, "结构体暂不支持比较运算");
             }
             if (expression.text == "==" || expression.text == "!=") {
-                const bool compatible = left.type == right.type ||
+                const bool nullComparison = left.type == TypeKind::Null || right.type == TypeKind::Null;
+                const bool compatible = nullComparison || left.type == right.type ||
                                         (isNumeric(left.type) && isNumeric(right.type));
                 if (!compatible) fail(expression.location, "不能比较 " + typeName(left.type) + " 和 " + typeName(right.type));
             } else if (!isNumeric(left.type) || !isNumeric(right.type)) {
                 fail(expression.location, "顺序比较需要数值操作数");
             }
-            emitter_.emit("op", {comparison->second, result, left.operand, right.operand});
+            const bool nullComparison = left.type == TypeKind::Null || right.type == TypeKind::Null;
+            if (nullComparison) {
+                emitter_.emit("op", {"strictEqual", result, left.operand, right.operand});
+                if (expression.text == "!=") {
+                    emitter_.emit("op", {"equal", result, result, "false"});
+                }
+            } else {
+                emitter_.emit("op", {comparison->second, result, left.operand, right.operand});
+            }
             return {TypeKind::Bool, result, false};
         }
 
@@ -2919,8 +4563,121 @@ private:
         return {target.type, result, false};
     }
 
+    struct ReferenceBinding {
+        std::size_t parameterIndex = 0;
+        Type type;
+        std::vector<std::string> directStorage;
+        std::optional<ExpressionResult::MemoryLocation> memory;
+        bool restricted = false;
+        SourceLocation location;
+    };
+
+    enum class AliasRelation { Disjoint, Overlap, Unknown };
+
+    AliasRelation memoryAlias(const ReferenceBinding& left, const ReferenceBinding& right) const {
+        const ExpressionResult::MemoryLocation& first = *left.memory;
+        const ExpressionResult::MemoryLocation& second = *right.memory;
+        if (first.identityHandle != second.identityHandle) {
+            const std::optional<Type> firstLink = implicitLinkType(first.identityHandle);
+            const std::optional<Type> secondLink = implicitLinkType(second.identityHandle);
+            if (firstLink == TypeKind::Memory && secondLink == TypeKind::Memory) {
+                return AliasRelation::Disjoint;
+            }
+            return AliasRelation::Unknown;
+        }
+        if (first.address == second.address) return AliasRelation::Overlap;
+        if (!first.normalized || !second.normalized ||
+            first.identityBase != second.identityBase ||
+            first.identityIndex != second.identityIndex ||
+            first.indexScale != second.indexScale) {
+            return AliasRelation::Unknown;
+        }
+
+        const long long firstStart = first.constantOffset;
+        const long long secondStart = second.constantOffset;
+        const std::uint64_t firstSize = static_cast<std::uint64_t>(typeSize(left.type));
+        const std::uint64_t secondSize = static_cast<std::uint64_t>(typeSize(right.type));
+        if (firstStart < secondStart) {
+            const std::uint64_t distance = static_cast<std::uint64_t>(secondStart) -
+                                           static_cast<std::uint64_t>(firstStart);
+            return firstSize <= distance ? AliasRelation::Disjoint : AliasRelation::Overlap;
+        }
+        if (secondStart < firstStart) {
+            const std::uint64_t distance = static_cast<std::uint64_t>(firstStart) -
+                                           static_cast<std::uint64_t>(secondStart);
+            return secondSize <= distance ? AliasRelation::Disjoint : AliasRelation::Overlap;
+        }
+        return AliasRelation::Overlap;
+    }
+
+    void validateReferenceAliases(const std::vector<ReferenceBinding>& bindings,
+                                  const FunctionDecl& function) const {
+        for (std::size_t left = 0; left < bindings.size(); ++left) {
+            for (std::size_t right = left + 1; right < bindings.size(); ++right) {
+                AliasRelation relation = AliasRelation::Disjoint;
+                if (bindings[left].memory && bindings[right].memory) {
+                    relation = memoryAlias(bindings[left], bindings[right]);
+                } else if (!bindings[left].memory && !bindings[right].memory) {
+                    for (const std::string& first : bindings[left].directStorage) {
+                        if (std::find(bindings[right].directStorage.begin(),
+                                      bindings[right].directStorage.end(), first) !=
+                            bindings[right].directStorage.end()) {
+                            relation = AliasRelation::Overlap;
+                            break;
+                        }
+                    }
+                }
+
+                const Parameter& firstParameter = function.parameters[bindings[left].parameterIndex];
+                const Parameter& secondParameter = function.parameters[bindings[right].parameterIndex];
+                if (relation == AliasRelation::Overlap) {
+                    fail(bindings[right].location,
+                         "引用实参存在已知别名: " + firstParameter.name + " 与 " + secondParameter.name);
+                }
+                if (relation == AliasRelation::Unknown &&
+                    (!bindings[left].restricted || !bindings[right].restricted)) {
+                    fail(bindings[right].location,
+                         "无法证明内存引用参数 " + firstParameter.name + " 与 " +
+                         secondParameter.name + " 不重叠，需要 restrict");
+                }
+            }
+        }
+    }
+
     ExpressionResult generateCall(const Expr& expression) {
-        if (expression.receiver) return generateBuiltinMemberCall(expression);
+        if (expression.receiver) {
+            const Type receiverType = expressionType(*expression.receiver);
+            if (const std::optional<std::string> member =
+                    memberFunctionName(receiverType, expression.text)) {
+                const FunctionDecl& declaration = *functions_.at(*member).declaration;
+                if (expression.arguments.size() + 1 != declaration.parameters.size()) {
+                    fail(expression.location, "成员函数 " + receiverType.structName + "." +
+                                              expression.text + " 参数数量错误");
+                }
+                std::vector<const Expr*> arguments;
+                arguments.reserve(expression.arguments.size() + 1);
+                arguments.push_back(expression.receiver.get());
+                for (const auto& argument : expression.arguments) arguments.push_back(argument.get());
+                return generateUserFunctionCall(*member, arguments, expression.location);
+            }
+            return generateBuiltinMemberCall(expression);
+        }
+        if (const std::optional<std::string> member = currentMemberFunctionName(expression.text)) {
+            const FunctionDecl& declaration = *functions_.at(*member).declaration;
+            if (expression.arguments.size() + 1 != declaration.parameters.size()) {
+                fail(expression.location, "成员函数 " + currentFunction_->memberOf + "." +
+                                          expression.text + " 参数数量错误");
+            }
+            Expr thisExpression;
+            thisExpression.kind = Expr::Kind::Variable;
+            thisExpression.location = expression.location;
+            thisExpression.text = "__this";
+            std::vector<const Expr*> arguments;
+            arguments.reserve(expression.arguments.size() + 1);
+            arguments.push_back(&thisExpression);
+            for (const auto& argument : expression.arguments) arguments.push_back(argument.get());
+            return generateUserFunctionCall(*member, arguments, expression.location);
+        }
         if (builtinOpFunction(expression.text)) return generateBuiltinOp(expression);
         if (expression.text == "print") return generatePrint(expression);
         if (expression.text == "printchar" || expression.text == "putchar") return generatePrintChar(expression);
@@ -2929,6 +4686,7 @@ private:
         if (expression.text == "printflush") return generatePrintFlush(expression);
         if (expression.text == "drawflush") return generateDrawFlush(expression);
         if (expression.text == "wait") return generateWait(expression);
+        if (expression.text == "stop" || expression.text == "exit") return generateStop(expression);
         if (expression.text == "rgb" || expression.text == "rgba") return generateColor(expression);
         if (expression.text == "pack_color" || expression.text == "unpack_color") return generateColorConversion(expression);
         if (expression.text == "draw_clear") return generateDrawClear(expression);
@@ -2946,22 +4704,80 @@ private:
         if (expression.text == "draw_reset") return generateDrawReset(expression);
         if (expression.text == "dot" || expression.text == "cross") return generateVectorProduct(expression);
         if (expression.text == "getlink") return generateGetLink(expression);
+        if (expression.text == "unit_bind") return generateUnitBind(expression);
+        if (const std::optional<LookupFunction> lookup = builtinLookupFunction(expression.text)) {
+            return generateLookup(expression, *lookup);
+        }
 
-        const auto functionIterator = functions_.find(expression.text);
-        if (functionIterator == functions_.end()) fail(expression.location, "未定义的函数: " + expression.text);
+        std::vector<const Expr*> arguments;
+        arguments.reserve(expression.arguments.size());
+        for (const auto& argument : expression.arguments) arguments.push_back(argument.get());
+        return generateUserFunctionCall(expression.text, arguments, expression.location);
+    }
+
+    ExpressionResult generateUnitBind(const Expr& expression) {
+        if (expression.arguments.size() != 1) fail(expression.location, "unit_bind 需要一个参数");
+        const ExpressionResult value = generateExpression(*expression.arguments[0]);
+        if (value.type != TypeKind::UnitKind && value.type != TypeKind::Unit) {
+            fail(expression.arguments[0]->location, "unit_bind 参数必须是 unit_kind 或 unit");
+        }
+        emitter_.emit(value.type == TypeKind::Unit ? "ubindunit" : "ubind", {value.operand});
+        const std::string result = temporary();
+        emitter_.emit("set", {result, "@unit"});
+        return {TypeKind::Unit, result, false};
+    }
+
+    ExpressionResult generateUserFunctionCall(const std::string& functionName,
+                                                const std::vector<const Expr*>& argumentExpressions,
+                                                SourceLocation location) {
+        const auto functionIterator = functions_.find(functionName);
+        if (functionIterator == functions_.end()) fail(location, "未定义的函数: " + functionName);
         const FunctionInfo& info = functionIterator->second;
         const FunctionDecl& function = *info.declaration;
-        if (expression.arguments.size() != function.parameters.size()) {
-            fail(expression.location, "函数 " + function.name + " 需要 " +
+        if (argumentExpressions.size() != function.parameters.size()) {
+            fail(location, "函数 " + function.name + " 需要 " +
                                       std::to_string(function.parameters.size()) + " 个参数");
         }
 
         std::vector<ExpressionResult> arguments;
-        arguments.reserve(expression.arguments.size());
-        for (std::size_t index = 0; index < expression.arguments.size(); ++index) {
-            ExpressionResult value = generateValue(*expression.arguments[index], function.parameters[index].type);
+        std::vector<ReferenceBinding> referenceBindings;
+        arguments.reserve(argumentExpressions.size());
+        for (std::size_t index = 0; index < argumentExpressions.size(); ++index) {
+            const Expr& argumentExpression = *argumentExpressions[index];
+            const Parameter& parameter = function.parameters[index];
+            if (!parameter.reference) {
+                ExpressionResult value = generateValue(argumentExpression, parameter.type);
+                arguments.push_back(materialize(value));
+                continue;
+            }
+
+            ExpressionResult value = generateExpression(argumentExpression);
+            if (value.type != parameter.type) {
+                fail(argumentExpression.location,
+                     "引用参数类型必须精确匹配 " + typeName(parameter.type));
+            }
+            if (!value.lvalue) fail(argumentExpression.location, "引用参数需要可赋值左值");
+
+            ReferenceBinding binding;
+            binding.parameterIndex = index;
+            binding.type = parameter.type;
+            binding.restricted = parameter.restricted;
+            binding.location = argumentExpression.location;
+            if (value.memoryLocation) {
+                binding.memory = value.memoryLocation;
+                const std::string frozenHandle = temporary();
+                const std::string frozenAddress = temporary();
+                emitter_.emit("set", {frozenHandle, binding.memory->handle});
+                emitter_.emit("set", {frozenAddress, binding.memory->address});
+                binding.memory->handle = frozenHandle;
+                binding.memory->address = frozenAddress;
+            } else {
+                binding.directStorage = operandsOf(value);
+            }
             arguments.push_back(materialize(value));
+            referenceBindings.push_back(std::move(binding));
         }
+        validateReferenceAliases(referenceBindings, function);
         for (std::size_t index = 0; index < arguments.size(); ++index) {
             const std::vector<std::string> values = operandsOf(arguments[index]);
             for (std::size_t component = 0; component < values.size(); ++component) {
@@ -2973,19 +4789,300 @@ private:
         emitter_.emit("set", {info.returnAddress, reference(returnLabel)});
         emitter_.emit("jump", {reference(info.entryLabel), "always", "0", "0"});
         emitter_.label(returnLabel);
-        if (function.returnType == TypeKind::Void) return {TypeKind::Void, "", false};
         std::vector<std::string> results;
-        for (const std::string& resultStorage : info.resultStorage) {
-            const std::string result = temporary();
-            emitter_.emit("set", {result, resultStorage});
-            results.push_back(result);
+        if (function.returnType != TypeKind::Void) {
+            for (const std::string& resultStorage : info.resultStorage) {
+                const std::string result = temporary();
+                emitter_.emit("set", {result, resultStorage});
+                results.push_back(result);
+            }
         }
+        for (const ReferenceBinding& binding : referenceBindings) {
+            const std::vector<std::string>& parameterValues = info.parameterStorage[binding.parameterIndex];
+            if (binding.memory) {
+                const ExpressionResult destination{binding.type, "", true, {}, binding.memory};
+                const ExpressionResult source = binding.type.isRuntimeAggregate()
+                    ? ExpressionResult{binding.type, "", false, parameterValues}
+                    : ExpressionResult{binding.type, parameterValues.front(), false};
+                storeMemory(destination, source);
+            } else {
+                for (std::size_t component = 0; component < binding.directStorage.size(); ++component) {
+                    emitter_.emit("set", {binding.directStorage[component], parameterValues[component]});
+                }
+            }
+        }
+        if (function.returnType == TypeKind::Void) return {TypeKind::Void, "", false};
         if (function.returnType.isRuntimeAggregate()) return {function.returnType, "", false, std::move(results)};
         return {function.returnType, results.front(), false, {}};
     }
 
+    std::array<std::string, 2> generateUnitCoordinates(const Expr& expression,
+                                                       std::size_t scalarCount,
+                                                       std::size_t pointCount,
+                                                       std::size_t& offset) {
+        if (expression.arguments.size() == pointCount) {
+            const ExpressionResult point = generateValue(*expression.arguments[0], Type("point"));
+            offset = 1;
+            return {point.components[0], point.components[1]};
+        }
+        if (expression.arguments.size() != scalarCount) {
+            fail(expression.location, expression.text + " 参数数量错误");
+        }
+        const ExpressionResult x = generateExpression(*expression.arguments[0]);
+        const ExpressionResult y = generateExpression(*expression.arguments[1]);
+        if (!isNumeric(x.type) || !isNumeric(y.type)) {
+            fail(expression.location, expression.text + " 的坐标必须是数值或 point");
+        }
+        offset = 2;
+        return {x.operand, y.operand};
+    }
+
+    void emitUnitControl(const ExpressionResult& receiver, std::string command,
+                         std::vector<std::string> parameters = {}) {
+        emitter_.emit("ubindunit", {receiver.operand});
+        parameters.resize(5, "0");
+        parameters.insert(parameters.begin(), std::move(command));
+        emitter_.emit("ucontrol", std::move(parameters));
+    }
+
+    ExpressionResult generateUnitMemberCall(const Expr& expression,
+                                             const ExpressionResult& receiver) {
+        if (expression.text == "idle" || expression.text == "stop" ||
+            expression.text == "auto_pathfind" || expression.text == "payload_drop" ||
+            expression.text == "payload_enter" || expression.text == "unbind") {
+            static const std::unordered_map<std::string_view, std::string_view> commands = {
+                {"idle", "idle"}, {"stop", "stop"}, {"auto_pathfind", "autoPathfind"},
+                {"payload_drop", "payDrop"}, {"payload_enter", "payEnter"},
+                {"unbind", "unbind"},
+            };
+            emitUnitControl(receiver, std::string(commands.at(expression.text)));
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "move" || expression.text == "pathfind" ||
+            expression.text == "mine" || expression.text == "deconstruct") {
+            std::size_t offset = 0;
+            const auto coordinates = generateUnitCoordinates(expression, 2, 1, offset);
+            (void)offset;
+            emitUnitControl(receiver, expression.text, {coordinates[0], coordinates[1]});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "approach" || expression.text == "within") {
+            std::size_t offset = 0;
+            const auto coordinates = generateUnitCoordinates(expression, 3, 2, offset);
+            const ExpressionResult radius = generateExpression(*expression.arguments[offset]);
+            if (expression.text == "within") {
+                const std::string result = temporary();
+                emitUnitControl(receiver, "within", {coordinates[0], coordinates[1], radius.operand, result});
+                return {TypeKind::Bool, result, false};
+            }
+            emitUnitControl(receiver, "approach", {coordinates[0], coordinates[1], radius.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "boost" || expression.text == "payload_take") {
+            const ExpressionResult enabled = toBoolean(generateExpression(*expression.arguments[0]),
+                                                       expression.arguments[0]->location);
+            emitUnitControl(receiver, expression.text == "boost" ? "boost" : "payTake",
+                            {enabled.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "target") {
+            std::size_t offset = 0;
+            const auto coordinates = generateUnitCoordinates(expression, 3, 2, offset);
+            const ExpressionResult shoot = toBoolean(generateExpression(*expression.arguments[offset]),
+                                                     expression.arguments[offset]->location);
+            emitUnitControl(receiver, "target", {coordinates[0], coordinates[1], shoot.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "targetp") {
+            const ExpressionResult target = generateValue(*expression.arguments[0], TypeKind::Posc);
+            const ExpressionResult shoot = toBoolean(generateExpression(*expression.arguments[1]),
+                                                     expression.arguments[1]->location);
+            emitUnitControl(receiver, "targetp", {target.operand, shoot.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "item_drop" || expression.text == "discard_items") {
+            std::string target = "@air";
+            std::size_t amountIndex = 0;
+            if (expression.text == "item_drop") {
+                target = generateValue(*expression.arguments[0], TypeKind::Building).operand;
+                amountIndex = 1;
+            }
+            const ExpressionResult amount = generateValue(*expression.arguments[amountIndex], TypeKind::Int);
+            emitUnitControl(receiver, "itemDrop", {target, amount.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "item_take") {
+            const ExpressionResult source = generateValue(*expression.arguments[0], TypeKind::Building);
+            const ExpressionResult item = generateValue(*expression.arguments[1], TypeKind::Item);
+            const ExpressionResult amount = generateValue(*expression.arguments[2], TypeKind::Int);
+            emitUnitControl(receiver, "itemTake", {source.operand, item.operand, amount.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "set_flag") {
+            const ExpressionResult value = generateExpression(*expression.arguments[0]);
+            emitUnitControl(receiver, "flag", {value.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "build") {
+            const bool pointForm = expressionType(*expression.arguments[0]) == Type("point");
+            std::size_t offset = 0;
+            std::array<std::string, 2> coordinates;
+            if (pointForm) {
+                const ExpressionResult point = generateValue(*expression.arguments[0], Type("point"));
+                coordinates = {point.components[0], point.components[1]};
+                offset = 1;
+            } else {
+                const ExpressionResult x = generateExpression(*expression.arguments[0]);
+                const ExpressionResult y = generateExpression(*expression.arguments[1]);
+                coordinates = {x.operand, y.operand};
+                offset = 2;
+            }
+            const ExpressionResult block = generateValue(*expression.arguments[offset], TypeKind::Block);
+            const ExpressionResult rotation = generateExpression(*expression.arguments[offset + 1]);
+            std::string config = "0";
+            if (expression.arguments.size() > offset + 2) {
+                config = generateExpression(*expression.arguments[offset + 2]).operand;
+            }
+            emitUnitControl(receiver, "build",
+                            {coordinates[0], coordinates[1], block.operand, rotation.operand, config});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "get_block") {
+            std::size_t offset = 0;
+            const auto coordinates = generateUnitCoordinates(expression, 5, 4, offset);
+            const std::array<Type, 3> types = {TypeKind::Block, TypeKind::Building, TypeKind::Block};
+            std::array<ExpressionResult, 3> destinations;
+            std::vector<std::string> outputs;
+            for (std::size_t index = 0; index < destinations.size(); ++index) {
+                destinations[index] = generateExpression(*expression.arguments[offset + index]);
+                if (destinations[index].type != types[index] || !destinations[index].lvalue) {
+                    fail(expression.arguments[offset + index]->location,
+                         "get_block 输出参数需要可赋值的 block、building、block 左值");
+                }
+                outputs.push_back(destinations[index].memoryLocation ? temporary()
+                                                                      : destinations[index].operand);
+            }
+            emitUnitControl(receiver, "getBlock",
+                            {coordinates[0], coordinates[1], outputs[0], outputs[1], outputs[2]});
+            for (std::size_t index = 0; index < destinations.size(); ++index) {
+                if (destinations[index].memoryLocation) {
+                    storeMemory(destinations[index], {types[index], outputs[index], false});
+                }
+            }
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "get_block_type" || expression.text == "get_block_building" ||
+            expression.text == "get_block_floor") {
+            std::size_t offset = 0;
+            const auto coordinates = generateUnitCoordinates(expression, 2, 1, offset);
+            (void)offset;
+            const std::string type = temporary();
+            const std::string building = temporary();
+            const std::string floor = temporary();
+            emitUnitControl(receiver, "getBlock",
+                            {coordinates[0], coordinates[1], type, building, floor});
+            if (expression.text == "get_block_building") return {TypeKind::Building, building, false};
+            return {TypeKind::Block, expression.text == "get_block_type" ? type : floor, false};
+        }
+        fail(expression.location, "未知的 unit 成员函数: " + expression.text);
+    }
+
     ExpressionResult generateBuiltinMemberCall(const Expr& expression) {
         const ExpressionResult receiver = generateExpression(*expression.receiver);
+        if (expression.text == "get") {
+            if (!isSenseableReceiver(receiver.type)) {
+                fail(expression.location, "get 的接收者不支持 sensor");
+            }
+            if (expression.arguments.size() != 1) {
+                fail(expression.location, "get 需要一个 sensor 或内容常量参数");
+            }
+            const Expr& selectorExpression = *expression.arguments[0];
+            const ExpressionResult selector = generateExpression(selectorExpression);
+            Type resultType;
+            if (selector.type == TypeKind::Sensor) {
+                if (selectorExpression.kind != Expr::Kind::Variable || selectorExpression.text.empty() ||
+                    selectorExpression.text.front() != '@' ||
+                    !isSenseableSensorName(std::string_view(selectorExpression.text).substr(1))) {
+                    fail(selectorExpression.location, "get 的 sensor 参数必须是可感知的内置 @ 常量");
+                }
+                resultType = *sensorResultType(std::string_view(selectorExpression.text).substr(1), receiver.type);
+            } else if (selector.type == TypeKind::Item || selector.type == TypeKind::Liquid ||
+                       selector.type == TypeKind::Block || selector.type == TypeKind::UnitKind) {
+                resultType = TypeKind::Number;
+            } else {
+                fail(selectorExpression.location,
+                     "get 参数必须是 sensor、item、liquid、block 或 unit_kind 常量");
+            }
+            const std::string result = temporary();
+            emitter_.emit("sensor", {result, receiver.operand, selector.operand});
+            return {resultType, result, false};
+        }
+        if (const std::optional<std::string_view> sensor = sensorAlias(expression.text)) {
+            if (!isSenseableReceiver(receiver.type)) {
+                fail(expression.location, expression.text + " 的接收者不支持 sensor");
+            }
+            if (!expression.arguments.empty()) {
+                fail(expression.location, expression.text + " 不需要参数");
+            }
+            const std::string result = temporary();
+            emitter_.emit("sensor", {result, receiver.operand, "@" + std::string(*sensor)});
+            return {*sensorResultType(*sensor, receiver.type), result, false};
+        }
+        if (receiver.type == TypeKind::Unit) return generateUnitMemberCall(expression, receiver);
+        if (expression.text == "radar" || builtinRadarMethod(expression.text)) {
+            if (receiver.type != TypeKind::Building) {
+                fail(expression.location, "Radar 的接收者必须是 building");
+            }
+            const std::optional<RadarMethod> method = builtinRadarMethod(expression.text);
+            if (!method && expression.arguments.size() < 2) {
+                fail(expression.location, "radar 需要 radar_sort 和 int order 参数");
+            }
+            const std::size_t filterCount = method
+                ? expression.arguments.size()
+                : expression.arguments.size() >= 2 ? expression.arguments.size() - 2 : 4;
+            if (filterCount > 3) {
+                fail(expression.location, expression.text + " 最多接受三个 Radar 筛选条件");
+            }
+            std::vector<std::string> filters;
+            filters.reserve(3);
+            for (std::size_t index = 0; index < filterCount; ++index) {
+                const Expr& argument = *expression.arguments[index];
+                const std::optional<RadarConstant> selector =
+                    argument.kind == Expr::Kind::Variable
+                        ? builtinRadarConstant(argument.text) : std::nullopt;
+                if (!selector || selector->type != TypeKind::RadarFilter) {
+                    fail(argument.location, "Radar 筛选条件必须是内置 radar_filter 常量");
+                }
+                filters.emplace_back(selector->operand);
+            }
+            while (filters.size() < 3) filters.emplace_back("any");
+
+            std::string sort;
+            std::string order;
+            if (method) {
+                sort = method->sort;
+                order = std::to_string(method->order);
+            } else {
+                const Expr& sortExpression = *expression.arguments[filterCount];
+                const std::optional<RadarConstant> selector =
+                    sortExpression.kind == Expr::Kind::Variable
+                        ? builtinRadarConstant(sortExpression.text) : std::nullopt;
+                if (!selector || selector->type != TypeKind::RadarSort) {
+                    fail(sortExpression.location, "Radar 排序必须是内置 radar_sort 常量");
+                }
+                sort = selector->operand;
+                const ExpressionResult orderValue = generateExpression(*expression.arguments.back());
+                if (orderValue.type != TypeKind::Int) {
+                    fail(expression.arguments.back()->location, "Radar order 必须是 int");
+                }
+                order = orderValue.operand;
+            }
+
+            const std::string result = temporary();
+            emitter_.emit("radar", {filters[0], filters[1], filters[2], sort,
+                                    receiver.operand, order, result});
+            return {TypeKind::Unit, result, false};
+        }
         if (receiver.type != TypeKind::Building) {
             fail(expression.location, "内置成员函数的接收者必须是 building");
         }
@@ -2998,13 +5095,77 @@ private:
             emitter_.emit("control", {"enabled", receiver.operand, value.operand});
             return {TypeKind::Void, "", false};
         }
-        if (expression.text == "get_enabled") {
-            if (!expression.arguments.empty()) {
-                fail(expression.location, "get_enabled 不需要参数");
+        if (expression.text == "shoot") {
+            if (expression.arguments.size() != 2) {
+                fail(expression.location, "shoot 需要 point 和开火状态两个参数");
             }
-            const std::string result = temporary();
-            emitter_.emit("sensor", {result, receiver.operand, "@enabled"});
-            return {TypeKind::Bool, result, false};
+            const ExpressionResult target = generateValue(*expression.arguments[0], Type("point"));
+            const ExpressionResult enabled = toBoolean(generateExpression(*expression.arguments[1]),
+                                                       expression.arguments[1]->location);
+            emitter_.emit("control", {"shoot", receiver.operand, target.components[0],
+                                      target.components[1], enabled.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "shootp") {
+            if (expression.arguments.size() != 2) {
+                fail(expression.location, "shootp 需要 posc 和开火状态两个参数");
+            }
+            const ExpressionResult target = generateValue(*expression.arguments[0], TypeKind::Posc);
+            const ExpressionResult enabled = toBoolean(generateExpression(*expression.arguments[1]),
+                                                       expression.arguments[1]->location);
+            emitter_.emit("control", {"shootp", receiver.operand, target.operand, enabled.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "set_color") {
+            if (expression.arguments.size() != 1) {
+                fail(expression.location, "set_color 需要一个 packed_color 参数");
+            }
+            const ExpressionResult color = generateValue(*expression.arguments[0], TypeKind::PackedColor);
+            emitter_.emit("control", {"color", receiver.operand, color.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (const std::optional<Type> parameter = configValueMemberType(expression.text)) {
+            if (expression.arguments.size() != 1) {
+                fail(expression.location, expression.text + " 需要一个 " + typeName(*parameter) + " 参数");
+            }
+            const ExpressionResult value = generateValue(*expression.arguments[0], *parameter);
+            emitter_.emit("control", {"config", receiver.operand, value.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (isPayloadKindMember(expression.text)) {
+            if (expression.arguments.size() != 1) {
+                fail(expression.location, expression.text + " 需要一个 block 或 unit_kind 参数");
+            }
+            const ExpressionResult value = generateExpression(*expression.arguments[0]);
+            if (value.type != TypeKind::Block && value.type != TypeKind::UnitKind) {
+                fail(expression.arguments[0]->location,
+                     expression.text + " 参数必须是 block 或 unit_kind");
+            }
+            emitter_.emit("control", {"config", receiver.operand, value.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (isConfigClearMember(expression.text)) {
+            if (!expression.arguments.empty()) {
+                fail(expression.location, expression.text + " 不需要参数");
+            }
+            emitter_.emit("control", {"config", receiver.operand, "null"});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "copy_configuration_from") {
+            if (expression.arguments.size() != 1) {
+                fail(expression.location, "copy_configuration_from 需要一个 building 参数");
+            }
+            const ExpressionResult source = generateValue(*expression.arguments[0], TypeKind::Building);
+            emitter_.emit("control", {"config", receiver.operand, source.operand});
+            return {TypeKind::Void, "", false};
+        }
+        if (expression.text == "set_rotation") {
+            if (expression.arguments.size() != 1) {
+                fail(expression.location, "set_rotation 需要一个 int 参数");
+            }
+            const ExpressionResult rotation = generateValue(*expression.arguments[0], TypeKind::Int);
+            emitter_.emit("control", {"config", receiver.operand, rotation.operand});
+            return {TypeKind::Void, "", false};
         }
         fail(expression.location, "未知的内置成员函数: " + expression.text);
     }
@@ -3039,6 +5200,12 @@ private:
         const ExpressionResult value = generateExpression(*expression.arguments.front());
         if (value.type == TypeKind::Void || value.type.isStruct()) fail(expression.location, "不能直接打印该类型的值");
         emitter_.emit("print", {value.operand});
+        return {TypeKind::Void, "", false};
+    }
+
+    ExpressionResult generateStop(const Expr& expression) {
+        if (!expression.arguments.empty()) fail(expression.location, expression.text + " 不需要参数");
+        emitter_.emit("stop", {});
         return {TypeKind::Void, "", false};
     }
 
@@ -3532,11 +5699,23 @@ private:
         return {TypeKind::Building, result, false};
     }
 
+    ExpressionResult generateLookup(const Expr& expression, const LookupFunction& lookup) {
+        if (expression.arguments.size() != 1) fail(expression.location, expression.text + " 需要一个参数");
+        const ExpressionResult index = generateExpression(*expression.arguments.front());
+        if (index.type != TypeKind::Int) {
+            fail(expression.location, expression.text + " 参数必须是 int，实际为 " + typeName(index.type));
+        }
+        const std::string result = temporary();
+        emitter_.emit("lookup", {std::string(lookup.content), result, index.operand});
+        return {lookup.result, result, false};
+    }
+
     const Program& program_;
     [[maybe_unused]] CompileOptions options_;
     IrBuilder emitter_;
     std::unordered_map<std::string, const StructDecl*> structs_;
     std::unordered_map<std::string, FunctionInfo> functions_;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> memberFunctions_;
     std::unordered_set<std::string> reachableFunctions_;
     std::vector<std::string> inlineOrder_;
     std::vector<std::unordered_map<std::string, Symbol>> scopes_;
@@ -3548,12 +5727,14 @@ private:
     std::size_t nextStorage_ = 0;
     std::size_t nextTemporary_ = 0;
     const std::string mainEntryLabel_ = "__main_loop_entry";
+    const std::string mainInitEndLabel_ = "__main_init_end";
 };
 
 } // namespace
 
 std::string compile(std::string_view source, const CompileOptions& options) {
-    Lexer lexer(source);
+    const std::string preprocessed = preprocess(source, options);
+    Lexer lexer(preprocessed);
     Parser parser(lexer.scan());
     Program program = parser.parse();
     return Generator(program, options).generate();

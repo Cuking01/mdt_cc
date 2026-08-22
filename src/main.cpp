@@ -24,7 +24,7 @@ void writeFile(const std::string& path, const std::string& content) {
 }
 
 void printUsage() {
-    std::cerr << "用法: mdtc [--debug] <输入文件> [-o <输出文件>]\n";
+    std::cerr << "用法: mdtc [--debug] [-I <包含目录>] <输入文件> [-o <输出文件>]\n";
 }
 
 } // namespace
@@ -38,6 +38,14 @@ int main(int argc, char** argv) {
         const std::string argument = argv[index];
         if (argument == "--debug") {
             options.debug = true;
+        } else if (argument == "-I") {
+            if (++index >= argc) {
+                printUsage();
+                return 2;
+            }
+            options.includePaths.push_back(argv[index]);
+        } else if (argument.size() > 2 && argument.starts_with("-I")) {
+            options.includePaths.push_back(argument.substr(2));
         } else if (argument == "-o") {
             if (++index >= argc) {
                 printUsage();
@@ -61,6 +69,7 @@ int main(int argc, char** argv) {
     }
 
     try {
+        options.sourcePath = inputPath;
         const std::string output = mdtc::compile(readFile(inputPath), options);
         if (outputPath.empty()) {
             std::cout << output;

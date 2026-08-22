@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(mdtc_lib
     src/compiler.cpp
+    src/preprocessor.cpp
 )
 
 target_include_directories(mdtc_lib PUBLIC include)

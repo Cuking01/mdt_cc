@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -191,6 +193,7 @@ private:
         if (operation == "always") return true;
         if (operation == "equal") return equal(left, right);
         if (operation == "notEqual") return !equal(left, right);
+        if (operation == "strictEqual") return left.index() == right.index() && equal(left, right);
         if (operation == "lessThan") return number(left) < number(right);
         if (operation == "lessThanEq") return number(left) <= number(right);
         if (operation == "greaterThan") return number(left) > number(right);
@@ -270,6 +273,9 @@ private:
             memory_[handle + ":" + std::to_string(address)] = read(instruction.at(1));
         } else if (opcode == "op") {
             write(instruction.at(2), operation(instruction.at(1), read(instruction.at(3)), read(instruction.at(4))));
+        } else if (opcode == "select") {
+            const bool selected = condition(instruction.at(2), read(instruction.at(3)), read(instruction.at(4)));
+            write(instruction.at(1), read(instruction.at(selected ? 5 : 6)));
         } else if (opcode == "jump") {
             if (condition(instruction.at(2), read(instruction.at(3)), read(instruction.at(4)))) {
                 counter_ = static_cast<std::size_t>(std::stoull(instruction.at(1)));
@@ -277,6 +283,9 @@ private:
         } else if (opcode == "getlink") {
             const auto index = static_cast<long long>(number(read(instruction.at(2))));
             write(instruction.at(1), ObjectValue{"link" + std::to_string(index)});
+        } else if (opcode == "lookup") {
+            const auto index = static_cast<long long>(number(read(instruction.at(3))));
+            write(instruction.at(2), ObjectValue{instruction.at(1) + "#" + std::to_string(index)});
         } else if (opcode == "print") {
             textBuffer_ += printable(read(instruction.at(1)));
         } else if (opcode == "printchar") {
@@ -337,6 +346,16 @@ void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+std::size_t countOccurrences(const std::string& text, const std::string& needle) {
+    std::size_t count = 0;
+    for (std::size_t position = 0;
+         (position = text.find(needle, position)) != std::string::npos;
+         position += needle.size()) {
+        ++count;
+    }
+    return count;
+}
+
 template <typename Function>
 void requireCompileError(Function&& function, const std::string& expectedText) {
     try {
@@ -381,6 +400,135 @@ void main_loop() {
     simulator.runUntilFlushes(1);
     require(simulator.flushes().at(0).target == "message1", "printflush 目标错误");
     require(simulator.flushes().at(0).text == "total=10", "控制流或函数结果错误");
+}
+
+void testSwitchCaseAndJumpTables() {
+    const std::string source = R"(
+void main_loop() {
+    int selector = 2;
+    int value = 0;
+    switch (selector) {
+        case 0:
+            value += 1;
+        case 1:
+            value += 10;
+            break;
+        case 2:
+            value += 100;
+        case 3:
+            value += 1000;
+            break;
+        default:
+            value = -1;
+    }
+
+    switch (99) {
+        case 0:
+            value = -100;
+    }
+
+    for (int index = 0; index < 4; index++) {
+        switch (index) {
+            case 1:
+                continue;
+            default:
+                value += index;
+        }
+    }
+
+    print(value);
+    printflush(message1);
+}
+)";
+
+    const std::string assembly = mdtc::compile(source);
+    require(assembly.find("set @counter") != std::string::npos,
+            "连续整数 case 应生成跳转表");
+    Simulator simulator(assembly);
+    simulator.runUntilFlushes(1);
+    require(simulator.flushes().at(0).text == "1105",
+            "switch 贯穿、break、continue 或无 default 语义错误，实际为 " +
+                simulator.flushes().at(0).text);
+
+    const std::string sparse = mdtc::compile(R"(
+void main_loop() {
+    int selector = 20;
+    switch (selector) {
+        case 0: print(0); break;
+        case 100: print(1); break;
+        case 200: print(2); break;
+        case 300: print(3); break;
+    }
+    printflush(message1);
+}
+)");
+    require(sparse.find("set @counter") == std::string::npos,
+            "稀疏 switch 不应生成跳转表");
+
+    const std::string denseWithHoles = mdtc::compile(R"(
+void main_loop() {
+    int value = 0;
+    switch (-1) {
+        case -2: value = 2; break;
+        case -1: value = 1; break;
+        case 0: value = 0; break;
+        case +1: value = -1; break;
+    }
+    switch (3) {
+        case 0: value = 100; break;
+        case 2: value = 200; break;
+        case 4: value = 400; break;
+        case 6: value = 600; break;
+        default: value += 10;
+    }
+    print(value);
+    printflush(message1);
+}
+)");
+    Simulator denseWithHolesSimulator(denseWithHoles);
+    denseWithHolesSimulator.runUntilFlushes(1);
+    require(denseWithHolesSimulator.flushes().at(0).text == "11",
+            "负 case、正号 case 或跳转表空洞处理错误");
+
+    const std::string returning = mdtc::compile(R"(
+int classify(int value) {
+    switch (value) {
+        case 0:
+        case 1:
+            return 10;
+        default:
+            return 20;
+    }
+}
+void main_loop() {
+    print(classify(1));
+    printflush(message1);
+}
+)");
+    Simulator returningSimulator(returning);
+    returningSimulator.runUntilFlushes(1);
+    require(returningSimulator.flushes().at(0).text == "10",
+            "switch 的完整返回分析错误");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "int f(int x) { switch (x) { case 0: return 1; } } "
+            "void main_loop() { print(f(1)); }");
+    }, "并非所有路径都返回值");
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "void main_loop() { switch (0) { case 1: break; case 1: break; } }");
+    }, "重复的 case 值");
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "void main_loop() { switch (0) { default: break; default: break; } }");
+    }, "只能有一个 default");
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { switch (1.5) { case 1: break; } }");
+    }, "switch 条件必须是 int");
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { switch (1) { case 1.5: break; } }");
+    }, "case 值必须是整数常量");
 }
 
 void testAutomaticInlining() {
@@ -444,12 +592,60 @@ void main_loop() {
     print(cycles);
     printflush(output);
 }
+
 )";
 
     Simulator simulator(mdtc::compile(source));
     simulator.runUntilFlushes(2);
     require(simulator.flushes().at(0).text == "1", "第一次 main_loop 的全局变量错误");
     require(simulator.flushes().at(1).text == "2", "全局变量没有跨 main_loop 保留");
+}
+
+void testMainInitRunsOnceBeforeMainLoop() {
+    const std::string source = R"(
+int value = 2;
+int initialization_calls = 0;
+
+void add_initial_value() {
+    value += 3;
+}
+
+void main_init() {
+    initialization_calls++;
+    add_initial_value();
+    value *= 2;
+    if (value == 10) return;
+    value = 100;
+}
+
+void main_loop() {
+    print(initialization_calls);
+    print(":");
+    print(value);
+    printflush(message1);
+    value++;
+}
+)";
+
+    Simulator simulator(mdtc::compile(source));
+    simulator.runUntilFlushes(2);
+    require(simulator.flushes().at(0).text == "1:10",
+            "main_init 没有在全局初始化后、main_loop 前执行");
+    require(simulator.flushes().at(1).text == "1:11",
+            "main_init 被重复执行或 main_loop 状态没有保留");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "void main_init(int value) {} void main_loop() {}");
+    }, "void main_init()");
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "void main_init() {} void invoke() { main_init(); } void main_loop() { invoke(); }");
+    }, "不能显式调用 main_init");
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "void main_init() { return 1; } void main_loop() {}");
+    }, "main_init 不能返回值");
 }
 
 void testGlobalInitializerFunctionReachability() {
@@ -499,6 +695,70 @@ void main_loop() {
     Simulator simulator(mdtc::compile(source));
     simulator.runUntilFlushes(1);
     require(simulator.flushes().at(0).text == "3", "while 或短路求值错误");
+}
+
+void testSafeComparisonJumpFusion() {
+    const std::string falseJumpSource = R"(
+void main_loop() {
+    int left = 1;
+    int right = 2;
+    if (left != right) {
+        print("if");
+    }
+    while (left != right) {
+        left += 1;
+    }
+    if (left) {
+        print(" numeric");
+    }
+    printflush(message1);
+}
+)";
+    const std::string falseJumpAssembly = mdtc::compile(falseJumpSource);
+    require(falseJumpAssembly.find("op notEqual ") == std::string::npos,
+            "安全的 != 条件没有与 jump 融合");
+    require(falseJumpAssembly.find("jump ") != std::string::npos &&
+                falseJumpAssembly.find(" equal ") != std::string::npos,
+            "融合后的条件跳转缺失");
+    Simulator falseJumpSimulator(falseJumpAssembly);
+    falseJumpSimulator.runUntilFlushes(1);
+    require(falseJumpSimulator.flushes().at(0).text == "if numeric",
+            "安全条件跳转融合改变了控制流语义");
+
+    const std::string trueJumpSource = R"(
+void main_loop() {
+    number left = 1;
+    number right = 2;
+    if (left < right) {
+        print("then");
+    } else {
+        print("else");
+    }
+    printflush(message1);
+}
+)";
+    const std::string trueJumpAssembly = mdtc::compile(trueJumpSource);
+    require(trueJumpAssembly.find("op lessThan ") == std::string::npos,
+            "带 else 的比较没有使用原谓词直接跳转");
+    require(trueJumpAssembly.find(" lessThan ") != std::string::npos,
+            "融合后的原谓词跳转缺失");
+    Simulator trueJumpSimulator(trueJumpAssembly);
+    trueJumpSimulator.runUntilFlushes(1);
+    require(trueJumpSimulator.flushes().at(0).text == "then",
+            "交换分支布局后 if/else 语义错误");
+
+    const std::string unsafeInverseAssembly = mdtc::compile(R"(
+void main_loop() {
+    number left = 1;
+    number right = 2;
+    if (left < right) {
+        print("then");
+    }
+    printflush(message1);
+}
+)");
+    require(unsafeInverseAssembly.find("op lessThan ") != std::string::npos,
+            "可能包含 NaN 的大小比较被不安全地反向融合");
 }
 
 void testLoopCarriedValueAcrossEmptyBlocks() {
@@ -554,6 +814,11 @@ void testCalleeStateUpdatesRemainLive() {
 int total = 0;
 
 void accumulate(int value) {
+    print("");
+    print("");
+    print("");
+    print("");
+    print("");
     if (value != 0) {
         total += value;
     }
@@ -600,6 +865,101 @@ void main_loop() {
     require(simulator.flushes().at(0).text == "value=3", "基础类型或隐式数值提升错误");
 }
 
+void testUtf8SourceIdentifiersStringsAndComments() {
+    const std::string source = std::string("\xEF\xBB\xBF") + R"(
+/* UTF-8 块注释：搬运计划 🚚 */
+int 求和(int 左值, int 右值) {
+    return 左值 + 右值;
+}
+
+void main_loop() {
+    // UTF-8 行注释不会生成指令
+    int　结果 = 求和(20, 22);
+    string 提示 = "搬运完成：你好，世界 🌍";
+    print(提示);
+    print(" = ");
+    print(结果);
+    printflush(message1);
+}
+)";
+
+    Simulator simulator(mdtc::compile(source));
+    simulator.runUntilFlushes(1);
+    require(simulator.flushes().at(0).text == "搬运完成：你好，世界 🌍 = 42",
+            "UTF-8 标识符、字符串或注释处理错误");
+
+    requireCompileError([] {
+        std::string invalid = "void main_loop() { int ";
+        invalid.push_back(static_cast<char>(0xC3));
+        invalid += "( = 0; }";
+        (void)mdtc::compile(invalid);
+    }, "非法 UTF-8 编码");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { /* 未结束的 UTF-8 注释");
+    }, "未结束的块注释");
+}
+
+void testPreprocessorDefinesAndIncludes() {
+    namespace fs = std::filesystem;
+    struct TemporaryDirectory {
+        fs::path path;
+        ~TemporaryDirectory() {
+            std::error_code error;
+            fs::remove_all(path, error);
+        }
+    } temporary{fs::temp_directory_path() / "mdtc_preprocessor_tests"};
+
+    std::error_code error;
+    fs::remove_all(temporary.path, error);
+    fs::create_directories(temporary.path / "relative", error);
+    require(!error, "无法创建预处理器测试目录");
+    fs::create_directories(temporary.path / "includes", error);
+    require(!error, "无法创建预处理器包含目录");
+
+    {
+        std::ofstream nested(temporary.path / "nested.mdtc", std::ios::binary);
+        nested << "#define NESTED_VALUE 30\n";
+        std::ofstream relative(temporary.path / "relative/values.mdtc", std::ios::binary);
+        relative << "#include \"../nested.mdtc\"\n#define RELATIVE_VALUE NESTED_VALUE\n";
+        std::ofstream searched(temporary.path / "includes/searched.mdtc", std::ios::binary);
+        searched << "#define SEARCH_VALUE 12 // 搜索路径中的常量\n";
+    }
+
+    mdtc::CompileOptions options;
+    options.sourcePath = (temporary.path / "main.mdtc").string();
+    options.includePaths.push_back((temporary.path / "includes").string());
+    const std::string source = R"(
+#include "relative/values.mdtc"
+#include <searched.mdtc>
+#define FIRST SECOND
+#define SECOND RELATIVE_VALUE
+#define 中文宏 SEARCH_VALUE
+
+void main_loop() {
+    // FIRST 和中文宏在注释中不能展开。
+    print("结果=");
+    print(FIRST + 中文宏);
+    printflush(message1);
+}
+)";
+
+    Simulator simulator(mdtc::compile(source, options));
+    simulator.runUntilFlushes(1);
+    require(simulator.flushes().at(0).text == "结果=42",
+            "对象宏、递归相对包含或 -I 搜索包含错误");
+
+    requireCompileError([] {
+        (void)mdtc::compile("#define CALL(value) value\nvoid main_loop() {}");
+    }, "暂不支持带参数的宏");
+
+    requireCompileError([&] {
+        mdtc::CompileOptions missingOptions;
+        missingOptions.sourcePath = (temporary.path / "missing-main.mdtc").string();
+        (void)mdtc::compile("#include \"missing.mdtc\"\nvoid main_loop() {}", missingOptions);
+    }, "找不到包含文件");
+}
+
 void testGetLink() {
     const std::string source = R"(
 extern message output;
@@ -616,13 +976,68 @@ void main_loop() {
     require(simulator.flushes().at(0).text == "link2", "getlink 返回的链接错误");
 }
 
+void testContentConstantsAndLookup() {
+    const std::string source = R"(
+void main_loop() {
+    item resource = @copper;
+    liquid fluid = @neoplasm;
+    block environment = @stone;
+    unit_kind produced = @dagger;
+    team owner = @sharded;
+    bool same = resource == @copper;
+    block found_block = lookup_block(0);
+    unit_kind found_unit = lookup_unit(1);
+    item found_item = lookup_item(2);
+    liquid found_liquid = lookup_liquid(3);
+    team found_team = lookup_team(4);
+    print(resource); print(fluid); print(environment); print(produced); print(owner); print(same);
+    print(found_block); print(found_unit); print(found_item); print(found_liquid); print(found_team);
+    printflush(message1);
+}
+)";
+
+    const std::string assembly = mdtc::compile(source);
+    require(assembly.find("@copper") != std::string::npos &&
+                assembly.find("@neoplasm") != std::string::npos &&
+                assembly.find("@stone") != std::string::npos &&
+                assembly.find("@dagger") != std::string::npos &&
+                assembly.find("@sharded") != std::string::npos,
+            "内容常量没有保留为原生 @ 名称");
+    require(assembly.find("lookup block ") != std::string::npos,
+            "lookup_block 没有生成 block lookup");
+    require(assembly.find("lookup unit ") != std::string::npos,
+            "lookup_unit 没有生成 unit lookup");
+    require(assembly.find("lookup item ") != std::string::npos,
+            "lookup_item 没有生成 item lookup");
+    require(assembly.find("lookup liquid ") != std::string::npos,
+            "lookup_liquid 没有生成 liquid lookup");
+    require(assembly.find("lookup team ") != std::string::npos,
+            "lookup_team 没有生成 team lookup");
+
+    Simulator simulator(assembly);
+    simulator.runUntilFlushes(1);
+    require(simulator.flushes().at(0).text.find("block#0unit#1item#2liquid#3team#4") != std::string::npos,
+            "类型化 lookup 的模拟执行错误");
+}
+
 void testBuiltinBuildingMemberMethods() {
     const std::string source = R"(
+extern posc enemy;
+
 void main_loop() {
     bool enabled = switch1.get_enabled();
     switch1.enable(false);
     switch2.enable(enabled);
+    point target = {80, 40};
+    posc tracked = turret2;
+    turret1.shoot(target, true);
+    turret1.shootp(tracked, false);
+    turret2.shootp(conveyor1, true);
+    turret3.shootp(enemy, true);
+    turret4.shootp(cell1, false);
+    illuminator1.set_color(pack_color(255, 0, 0));
 }
+
 )";
 
     const std::string assembly = mdtc::compile(source);
@@ -635,6 +1050,413 @@ void main_loop() {
             "enable(false) 没有生成 control 指令");
     require(assembly.find("control enabled switch2 ") != std::string::npos,
             "enable(bool) 没有生成 control 指令");
+    require(assembly.find("control shoot turret1 80 40 true\n") != std::string::npos,
+            "shoot(point, bool) 没有生成 control shoot 指令");
+    require(assembly.find("control shootp turret1 ") != std::string::npos,
+            "shootp(posc, bool) 没有生成 control shootp 指令");
+    require(assembly.find("control shootp turret2 conveyor1 true\n") != std::string::npos,
+            "shootp 没有接受隐式转换为 posc 的 building");
+    require(assembly.find("control shootp turret3 enemy true\n") != std::string::npos,
+            "shootp 没有接受 extern posc");
+    require(assembly.find("control shootp turret4 cell1 false\n") != std::string::npos,
+            "shootp 没有接受具备 Posc 能力的专用建筑句柄");
+    require(assembly.find("control color illuminator1 %ff0000ff\n") != std::string::npos,
+            "set_color(packed_color) 没有生成 control color 指令");
+}
+
+void testUnitBindAndControlMemberMethods() {
+    const std::string source = R"(
+void main_loop() {
+    unit worker = unit_bind(@poly);
+    worker.idle();
+    worker.stop();
+    worker.move(10, 20);
+    worker.move(point{30, 40});
+    worker.approach(point{50, 60}, 4);
+    worker.pathfind(70, 80);
+    worker.auto_pathfind();
+    worker.boost(true);
+    worker.target(point{90, 100}, true);
+    worker.targetp(worker, false);
+    worker.item_drop(container1, 10);
+    worker.discard_items(3);
+    worker.item_take(vault1, @copper, 20);
+    worker.payload_drop();
+    worker.payload_take(true);
+    worker.payload_enter();
+    worker.mine(point{11, 12});
+    worker.set_flag(7);
+    worker.build(point{13, 14}, @router, build_up);
+    worker.build(15, 16, @conveyor, 2, @copper);
+    worker.deconstruct(point{17, 18});
+    block type = null;
+    building building_at = null;
+    block floor = null;
+    worker.get_block(point{19, 20}, type, building_at, floor);
+    type = worker.get_block_type(21, 22);
+    building_at = worker.get_block_building(point{23, 24});
+    floor = worker.get_block_floor(25, 26);
+    bool close = worker.within(point{27, 28}, 5);
+    print(close);
+    unit rebound = unit_bind(worker);
+    rebound.stop();
+    worker.unbind();
+    worker.idle();
+}
+)";
+
+    const std::string assembly = mdtc::compile(source);
+    require(assembly.find("ubindunit") == std::string::npos,
+            "内部 ubindunit 操作没有降低为 ubind");
+    require(countOccurrences(assembly, "ubind ") == 2,
+            "刚绑定或连续控制同一 unit 时没有消除重复 ubind");
+    require(assembly.find("ubind @poly\n") != std::string::npos,
+            "unit_bind(unit_kind) 没有生成 ubind");
+    require(assembly.find("ucontrol move 10 20 0 0 0\n") != std::string::npos &&
+                assembly.find("ucontrol move 30 40 0 0 0\n") != std::string::npos,
+            "move 的标量或 point 重载错误");
+    require(assembly.find("ucontrol itemDrop container1 10 0 0 0\n") != std::string::npos &&
+                assembly.find("ucontrol itemDrop @air 3 0 0 0\n") != std::string::npos,
+            "item_drop 或 discard_items 封装错误");
+    require(assembly.find("ucontrol itemTake vault1 @copper 20 0 0\n") != std::string::npos,
+            "item_take 封装错误");
+    require(assembly.find("ucontrol build 13 14 @router 1 0\n") != std::string::npos &&
+                assembly.find("ucontrol build 15 16 @conveyor 2 @copper\n") != std::string::npos,
+            "build 重载、方向常量或配置参数错误");
+    require(countOccurrences(assembly, "ucontrol getBlock ") == 4,
+            "get_block 原版或拆分接口没有生成 getBlock");
+    require(assembly.find("ucontrol within 27 28 5 ") != std::string::npos,
+            "within 没有使用返回值输出槽");
+    require(assembly.find("ucontrol unbind 0 0 0 0 0\nubind @unit\n") != std::string::npos,
+            "unbind 后错误删除了必要的重新绑定");
+}
+
+void testConfigMemberMethods() {
+    const std::string source = R"(
+extern building factory;
+extern building item_source;
+extern building liquid_source;
+extern building sorter;
+extern building unloader;
+extern building landing_pad;
+extern building payload_source;
+extern building payload_router;
+extern building constructor;
+extern building other_factory;
+
+void main_loop() {
+    factory.set_production(@dagger);
+    factory.clear_unit_command();
+    item_source.set_output_item(@copper);
+    item_source.clear_output_item();
+    liquid_source.set_output_liquid(@water);
+    liquid_source.clear_output_liquid();
+    sorter.set_sort_item(@lead);
+    sorter.clear_sort_item();
+    unloader.set_unload_item(@titanium);
+    unloader.clear_unload_item();
+    landing_pad.set_delivery_item(@silicon);
+    landing_pad.clear_delivery_item();
+    payload_source.set_payload_kind(@router);
+    payload_source.set_payload_kind(@dagger);
+    payload_source.clear_payload_kind();
+    payload_router.set_straight_payload(@router);
+    payload_router.set_straight_payload(@dagger);
+    payload_router.clear_straight_payload();
+    payload_router.set_rotation(3);
+    constructor.set_recipe(@beryllium-wall-large);
+    constructor.clear_recipe();
+    factory.copy_configuration_from(other_factory);
+}
+)";
+
+    const std::string assembly = mdtc::compile(source);
+    const std::vector<std::string> expected = {
+        "control config factory @dagger\n",
+        "control config factory null\n",
+        "control config item_source @copper\n",
+        "control config item_source null\n",
+        "control config liquid_source @water\n",
+        "control config liquid_source null\n",
+        "control config sorter @lead\n",
+        "control config sorter null\n",
+        "control config unloader @titanium\n",
+        "control config unloader null\n",
+        "control config landing_pad @silicon\n",
+        "control config landing_pad null\n",
+        "control config payload_source @router\n",
+        "control config payload_source @dagger\n",
+        "control config payload_source null\n",
+        "control config payload_router @router\n",
+        "control config payload_router @dagger\n",
+        "control config payload_router null\n",
+        "control config payload_router 3\n",
+        "control config constructor @beryllium-wall-large\n",
+        "control config constructor null\n",
+        "control config factory other_factory\n",
+    };
+    for (const std::string& instruction : expected) {
+        require(assembly.find(instruction) != std::string::npos,
+                "缺少专用 config lowering: " + instruction);
+    }
+}
+
+void testSensorMemberMethods() {
+    const std::vector<std::pair<std::string, std::string>> aliases = {
+        {"get_total_items", "totalItems"}, {"get_first_item", "firstItem"},
+        {"get_total_liquids", "totalLiquids"}, {"get_total_power", "totalPower"},
+        {"get_item_capacity", "itemCapacity"}, {"get_liquid_capacity", "liquidCapacity"},
+        {"get_power_capacity", "powerCapacity"}, {"get_power_net_stored", "powerNetStored"},
+        {"get_power_net_capacity", "powerNetCapacity"}, {"get_power_net_in", "powerNetIn"},
+        {"get_power_net_out", "powerNetOut"}, {"get_ammo", "ammo"},
+        {"get_ammo_capacity", "ammoCapacity"}, {"get_current_ammo_type", "currentAmmoType"},
+        {"get_memory_capacity", "memoryCapacity"}, {"get_health", "health"},
+        {"get_max_health", "maxHealth"}, {"get_heat", "heat"}, {"get_shield", "shield"},
+        {"get_armor", "armor"}, {"get_efficiency", "efficiency"}, {"get_progress", "progress"},
+        {"get_timescale", "timescale"}, {"get_rotation", "rotation"}, {"get_x", "x"},
+        {"get_y", "y"}, {"get_velocity_x", "velocityX"}, {"get_velocity_y", "velocityY"},
+        {"get_shoot_x", "shootX"}, {"get_shoot_y", "shootY"}, {"get_camera_x", "cameraX"},
+        {"get_camera_y", "cameraY"}, {"get_camera_width", "cameraWidth"},
+        {"get_camera_height", "cameraHeight"}, {"get_display_width", "displayWidth"},
+        {"get_display_height", "displayHeight"}, {"get_buffer_size", "bufferSize"},
+        {"get_operations", "operations"}, {"get_size", "size"}, {"get_solid", "solid"},
+        {"get_dead", "dead"}, {"get_range", "range"}, {"get_shooting", "shooting"},
+        {"get_boosting", "boosting"}, {"get_mine_x", "mineX"}, {"get_mine_y", "mineY"},
+        {"get_mining", "mining"}, {"get_build_x", "buildX"}, {"get_build_y", "buildY"},
+        {"get_ping_x", "pingX"}, {"get_ping_y", "pingY"}, {"get_ping_text", "pingText"},
+        {"get_building", "building"}, {"get_breaking", "breaking"}, {"get_speed", "speed"},
+        {"get_team", "team"}, {"get_type", "type"}, {"get_flag", "flag"},
+        {"get_flying", "flying"}, {"get_controlled", "controlled"},
+        {"get_controller", "controller"}, {"get_name", "name"},
+        {"get_payload_count", "payloadCount"}, {"get_payload_type", "payloadType"},
+        {"get_total_payload", "totalPayload"}, {"get_payload_capacity", "payloadCapacity"},
+        {"get_max_units", "maxUnits"}, {"get_id", "id"},
+        {"get_selected_block", "selectedBlock"}, {"get_selected_rotation", "selectedRotation"},
+        {"get_bullet_lifetime", "bulletLifetime"}, {"get_bullet_time", "bulletTime"},
+        {"get_enabled", "enabled"}, {"get_config", "config"}, {"get_color", "color"},
+    };
+
+    std::string source = "extern building target; extern posc tracked; void main_loop() {";
+    for (const auto& [method, sensor] : aliases) {
+        (void)sensor;
+        source += "print(target." + method + "());";
+    }
+    source += "number health = target.get(@health);";
+    source += "bool enabled = target.get(@enabled);";
+    source += "item first = target.get(@firstItem);";
+    source += "packed_color sensed_color = target.get(@color);";
+    source += "string target_name = target.get_name();";
+    source += "block constructed = target.get_building();";
+    source += "bool breaking = target.get_breaking();";
+    source += "number copper = target.get(@copper);";
+    source += "number water = target.get(@water);";
+    source += "number payloads = target.get(@dagger);";
+    source += "number blocks = target.get(@router);";
+    source += "print(@router.get_id());";
+    source += "print(message1.get_buffer_size());";
+    source += "print(tracked.get_dead());";
+    source += "building planned = tracked.get_building();";
+    source += "sensor_value dynamic_value = target.get_config();";
+    source += "print(dynamic_value.get_name());";
+    source += "print(\"abc\".get_size());";
+    source += "printflush(message1);}";
+
+    const std::string assembly = mdtc::compile(source);
+    for (const auto& [method, sensor] : aliases) {
+        (void)method;
+        require(assembly.find("sensor ") != std::string::npos &&
+                    assembly.find(" target @" + sensor + "\n") != std::string::npos,
+                "缺少 sensor 别名 lowering: " + sensor);
+    }
+    require(assembly.find(" target @copper\n") != std::string::npos &&
+                assembly.find(" target @water\n") != std::string::npos &&
+                assembly.find(" target @dagger\n") != std::string::npos &&
+                assembly.find(" target @router\n") != std::string::npos,
+            "内容常量没有作为 sensor 属性生成");
+    require(assembly.find(" @router @id\n") != std::string::npos,
+            "内容对象接收者没有生成 sensor");
+    require(assembly.find(" message1 @bufferSize\n") != std::string::npos,
+            "专用建筑句柄没有生成 sensor");
+    require(assembly.find(" tracked @dead\n") != std::string::npos,
+            "posc 接收者没有生成 sensor");
+}
+
+void testNullLiteralAndComparison() {
+    const std::string source = R"(
+void main_loop() {
+    number missing = cell1[0];
+    number zero = 0;
+    sensor_value dynamic_value = null;
+    building absent = null;
+    print(missing == null); print(",");
+    print(zero == null); print(",");
+    print(missing != null); print(",");
+    print(zero != null); print(",");
+    print(dynamic_value == null); print(",");
+    print(absent != null);
+    if (missing != null) print(",bad");
+    if (zero != null) print(",ok");
+    printflush(message1);
+}
+)";
+
+    const std::string assembly = mdtc::compile(source);
+    require(assembly.find("strictEqual") != std::string::npos,
+            "null 比较没有使用 strictEqual");
+    Simulator simulator(assembly);
+    simulator.runUntilFlushes(1);
+    require(assembly.find(" strictEqual ") != std::string::npos,
+            "null 条件没有融合为 strictEqual jump");
+    require(simulator.flushes().at(0).text == "1,0,0,1,1,0,ok",
+            "null 比较没有区分对象态 null 和数值零");
+}
+
+void testStopAndExit() {
+    const std::string assembly = mdtc::compile(R"(
+void halt() {
+    exit();
+}
+
+void main_loop() {
+    stop();
+    halt();
+}
+)");
+    std::size_t stopCount = 0;
+    for (std::size_t position = assembly.find("stop\n"); position != std::string::npos;
+         position = assembly.find("stop\n", position + 1)) {
+        ++stopCount;
+    }
+    require(stopCount == 2, "stop() 和 exit() 没有都降低为 stop 指令");
+}
+
+void testRadarMemberMethods() {
+    const std::string assembly = mdtc::compile(R"(
+int order = 0;
+
+void main_loop() {
+    unit first = turret1.radar_nearest();
+    posc second = turret2.radar_max_health(radar_enemy);
+    posc third = turret3.radar_min_shield(radar_enemy, radar_flying);
+    posc fourth = turret4.radar_max_armor(radar_enemy, radar_flying, radar_attacker);
+    posc fifth = turret5.radar(radar_max_health, order);
+    posc sixth = turret6.radar(radar_ground, radar_distance, order);
+}
+)");
+
+    const std::vector<std::string> expected = {
+        "radar any any any distance turret1 1 ",
+        "radar enemy any any health turret2 1 ",
+        "radar enemy flying any shield turret3 0 ",
+        "radar enemy flying attacker armor turret4 1 ",
+        "radar any any any maxHealth turret5 ",
+        "radar ground any any distance turret6 ",
+    };
+    for (const std::string& instruction : expected) {
+        require(assembly.find(instruction) != std::string::npos,
+                "缺少 Radar member lowering: " + instruction);
+    }
+}
+
+void testConditionalSelect() {
+    const std::string source = R"(
+int side_effects = 0;
+
+int record(int value) {
+    side_effects++;
+    return value;
+}
+
+void main_loop() {
+    int first = true ? 3 : 4;
+    number mixed = false ? 1 : 2.5;
+    building selected = true ? turret1 : null;
+    point position = false ? point{1, 2} : point{3, 4};
+    int nested = true ? (false ? 5 : 6) : 7;
+    int compared = 2 < 3 ? 8 : 9;
+    int numeric_condition = 2 ? 10 : 11;
+    int pure_builtin = true ? abs(-12) : max(13, 14);
+    int lazy_true = true ? record(20) : record(21);
+    int lazy_false = false ? record(22) : record(23);
+    int branch_value = 0;
+    int assigned = false ? (branch_value = 24) : (branch_value = 25);
+    int incremented = true ? branch_value++ : branch_value--;
+    number lazy_random = false ? rand(100) : 26;
+    print(first); print(","); print(mixed); print(",");
+    print(selected == turret1); print(",");
+    print(position.x); print(","); print(position.y); print(",");
+    print(nested); print(","); print(compared); print(","); print(numeric_condition); print(",");
+    print(pure_builtin);
+    print(","); print(lazy_true); print(","); print(lazy_false); print(",");
+    print(side_effects); print(","); print(assigned); print(",");
+    print(incremented); print(","); print(branch_value); print(","); print(lazy_random);
+    true ? print(",void-true") : print(",void-false");
+    printflush(message1);
+}
+)";
+
+    const std::string assembly = mdtc::compile(source);
+    require(assembly.find("select ") != std::string::npos,
+            "三目运算符没有生成 select 指令");
+    require(assembly.find(" lessThan 2 3 8 9\n") != std::string::npos,
+            "三目比较条件没有融合进 select");
+    Simulator simulator(assembly);
+    simulator.runUntilFlushes(1);
+    require(simulator.flushes().at(0).text ==
+                "3,2.5,1,3,4,6,8,10,12,20,23,2,25,25,26,26,void-true",
+            "三目 select 运行语义错误");
+}
+
+void testUserMemberFunctions() {
+    const std::string source = R"(
+struct counter {
+    int value;
+
+    void add(int amount) {
+        this->value += amount;
+    }
+
+    int get() {
+        return value;
+    }
+
+    int add_and_get(int amount) {
+        this->add(amount);
+        return get();
+    }
+};
+
+struct wrapper {
+    counter inner;
+
+    void add_twice(int amount) {
+        inner.add(amount);
+        this->inner.add(amount);
+    }
+};
+
+void main_loop() {
+    counter local{1};
+    local.add(2);
+    int first = local.add_and_get(3);
+
+    wrapper nested{{10}};
+    nested.add_twice(4);
+
+    arr<counter> values{cell1, 0};
+    values[0] = counter{20};
+    values[0].add(5);
+
+    print(first); print(","); print(local.get()); print(",");
+    print(nested.inner.get()); print(","); print(values[0].get());
+    printflush(message1);
+}
+)";
+
+    Simulator simulator(mdtc::compile(source));
+    simulator.runUntilFlushes(1);
+    require(simulator.flushes().at(0).text == "6,6,18,25",
+            "用户成员函数或 this-> 语义错误");
 }
 
 void testImplicitLinksAndPrintFlushIndex() {
@@ -919,6 +1741,11 @@ void main_loop() {
     print(sizeof(message));
     print(sizeof(building));
     print(sizeof(display));
+    print(sizeof(item));
+    print(sizeof(liquid));
+    print(sizeof(block));
+    print(sizeof(unit_kind));
+    print(sizeof(team));
     print(sizeof(getlink(0)));
     printflush(message1);
 }
@@ -928,7 +1755,7 @@ void main_loop() {
     require(assembly.find("getlink") == std::string::npos, "sizeof 错误地求值了操作数");
     Simulator simulator(assembly);
     simulator.runUntilFlushes(1);
-    require(simulator.flushes().at(0).text == "111111111", "内置类型 sizeof 不全为 1");
+    require(simulator.flushes().at(0).text == "11111111111111", "内置类型 sizeof 不全为 1");
 }
 
 void testBuiltinPointVectorAndRect() {
@@ -1080,6 +1907,101 @@ void main_loop() {
     require(aggregateSimulator.flushes().at(0).text == "4,5", "聚合类型数组读写错误");
 }
 
+void testReferenceParameters() {
+    const std::string source = R"(
+arr<int> values = {cell1, 0};
+arr<point> points = {cell2, 0};
+int selected = 0;
+
+int update(int& value) {
+    value += 3;
+    return value * 2;
+}
+
+void shift(point& value) {
+    value.x += 4;
+    value.y += 5;
+}
+
+void swap(int& first, int& second) {
+    int temporary = first;
+    first = second;
+    second = temporary;
+}
+
+void set_value(int& value, int unused) {
+    value = 9;
+}
+
+int change_selection() {
+    selected = 1;
+    return 0;
+}
+
+void main_loop() {
+    int direct = 4;
+    int returned = update(direct);
+    point local = {1, 2};
+    shift(local);
+
+    values[0] = 10;
+    values[1] = 20;
+    swap(values[0], values[1]);
+    points[0] = point{7, 8};
+    shift(points[0]);
+
+    selected = 0;
+    set_value(values[selected], change_selection());
+    print(direct); print(","); print(returned); print(",");
+    print(local.x); print(","); print(local.y); print(",");
+    print(values[0]); print(","); print(values[1]); print(",");
+    print(points[0].x); print(","); print(points[0].y);
+    printflush(message1);
+}
+)";
+
+    Simulator simulator(mdtc::compile(source));
+    simulator.runUntilFlushes(1);
+    require(simulator.flushes().at(0).text == "7,14,5,7,9,10,11,13",
+            "引用参数复制、返回写回、结构体写回或地址固定错误");
+
+    const std::string restrictedSource = R"(
+arr<int> values = {cell1, 0};
+void swap(restrict int& first, restrict int& second) {
+    int temporary = first;
+    first = second;
+    second = temporary;
+}
+void main_loop() {
+    int first = 0;
+    int second = 1;
+    values[0] = 3;
+    values[1] = 4;
+    swap(values[first], values[second]);
+    print(values[0]); print(","); print(values[1]);
+    printflush(message1);
+}
+)";
+    Simulator restrictedSimulator(mdtc::compile(restrictedSource));
+    restrictedSimulator.runUntilFlushes(1);
+    require(restrictedSimulator.flushes().at(0).text == "4,3",
+            "restrict 动态内存引用写回错误");
+
+    const std::string distinctMemorySource = R"(
+void swap(number& first, number& second) {
+    number temporary = first;
+    first = second;
+    second = temporary;
+}
+void main_loop() {
+    cell1[0] = 1;
+    cell2[0] = 2;
+    swap(cell1[0], cell2[0]);
+}
+)";
+    (void)mdtc::compile(distinctMemorySource);
+}
+
 void testDiagnostics() {
     const std::string deadFunctionAssembly =
         mdtc::compile("void recurse() { recurse(); } void main_loop() {}");
@@ -1117,6 +2039,209 @@ void testDiagnostics() {
     requireCompileError([] {
         (void)mdtc::compile("void main_loop() { building value = getlink(1.5); }");
     }, "必须是 int");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { int value = @copper; }");
+    }, "不能把 item 赋值给 int");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { print(@copper + @lead); }");
+    }, "算术运算需要数值操作数");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { print(@copper == @water); }");
+    }, "不能比较 item 和 liquid");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { unit_kind value = @router; }");
+    }, "不能把 block 赋值给 unit_kind");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { print(@not-a-content); }");
+    }, "未知或暂不支持");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { arr<item> values = {}; }");
+    }, "数组元素类型不能存储");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { item value = lookup_item(1.5); }");
+    }, "参数必须是 int");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "extern building factory; void main_loop() { factory.set_production(@copper); }");
+    }, "不能把 item 赋值给 unit_kind");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "extern building source; void main_loop() { source.set_output_item(@water); }");
+    }, "不能把 liquid 赋值给 item");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "extern building source; void main_loop() { source.set_payload_kind(@copper); }");
+    }, "参数必须是 block 或 unit_kind");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "extern building source; void main_loop() { source.clear_recipe(1); }");
+    }, "不需要参数");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "extern building router; void main_loop() { router.set_rotation(1.5); }");
+    }, "不能把 number 赋值给 int");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "extern building first; void main_loop() { first.copy_configuration_from(@router); }");
+    }, "不能把 block 赋值给 building");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "extern building target; void main_loop() { print(target.get(@shoot)); }");
+    }, "必须是可感知的内置 @ 常量");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "extern building target; void main_loop() { print(target.get(@sharded)); }");
+    }, "必须是 sensor、item、liquid、block 或 unit_kind");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "extern building target; void main_loop() { print(target.get(@health, @x)); }");
+    }, "需要一个 sensor 或内容常量参数");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "extern building target; void main_loop() { print(target.get_health(1)); }");
+    }, "不需要参数");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "extern building target; void main_loop() { int value = target.get_first_item(); }");
+    }, "不能把 item 赋值给 int");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "extern building target; void main_loop() { sensor property = @health; print(target.get(property)); }");
+    }, "必须是可感知的内置 @ 常量");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { arr<sensor_value> values = {}; }");
+    }, "数组元素类型不能存储");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { number value = null; }");
+    }, "不能把 null 赋值给 number");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { stop(1); }");
+    }, "不需要参数");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { exit(false); }");
+    }, "不需要参数");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { radar_filter filter = radar_enemy; }");
+    }, "选择器类型不能声明变量");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { int radar_enemy = 0; }");
+    }, "内置常量名称不能被声明");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { turret1.radar(); }");
+    }, "需要 radar_sort 和 int order");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { turret1.radar_nearest(radar_distance); }");
+    }, "必须是内置 radar_filter 常量");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "void main_loop() { turret1.radar_nearest(radar_enemy, radar_flying, radar_attacker, radar_boss); }");
+    }, "最多接受三个");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { turret1.radar(radar_enemy, radar_health, true); }");
+    }, "order 必须是 int");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { turret1.radar(radar_enemy, radar_enemy, 1); }");
+    }, "必须是内置 radar_sort 常量");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { int value = true ? 1 : @copper; }");
+    }, "两支类型不兼容");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "void main_loop() { print(true ? radar_enemy : radar_flying); }");
+    }, "选择器不能作为三目运算符结果");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { int value = true ? 1; }");
+    }, "缺少冒号");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { true ? print(1) : 2; }");
+    }, "必须同时为 void 或同时产生值");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "struct value { int x; int bad() { return this; } }; void main_loop() {}");
+    }, "this 不能作为独立表达式");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "struct value { int x; }; void main_loop() { value v{}; print(v->x); }");
+    }, "需要表达式");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "struct value { int x; void set() { this->x = 1; } }; "
+            "void main_loop() { value{}.set(); }");
+    }, "引用参数需要可赋值左值");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "struct value { int x; void set(int amount) { x = amount; } }; "
+            "void main_loop() { value v{}; v.set(); }");
+    }, "参数数量错误");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "struct value { int x; void take(restrict int& input) { x = input; } }; "
+            "void main_loop() { value v{}; v.take(v.x); }");
+    }, "引用实参存在已知别名");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "struct value { void recurse() { recurse(); } }; void main_loop() { value v{}; v.recurse(); }");
+    }, "暂不支持递归调用");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { turret1.shoot(1, true); }");
+    }, "不能把 int 赋值给 point");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { turret1.shoot(point{}, point{}); }");
+    }, "条件需要 bool 或数值类型");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { turret1.shootp(1, true); }");
+    }, "不能把 int 赋值给 posc");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { illuminator1.set_color(color{}); }");
+    }, "不能把 color 赋值给 packed_color");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { arr<posc> targets = {}; }");
+    }, "数组元素类型不能存储");
 
     requireCompileError([] {
         (void)mdtc::compile("void main_loop() { printchar(65.0); }");
@@ -1221,6 +2346,56 @@ void testDiagnostics() {
     requireCompileError([] {
         (void)mdtc::compile("void main_loop() { arr2d<int> value = {}; value[1] = {}; }");
     }, "赋值左侧必须是可修改变量");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void f(int& a, int& b) {} void main_loop() { int x = 0; f(x, x); }");
+    }, "已知别名");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "void f(point& whole, number& field) {} void main_loop() { point p = {}; f(p, p.x); }");
+    }, "已知别名");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "arr<int> a = {cell1, 0}; void f(restrict int& x, restrict int& y) {} "
+            "void main_loop() { f(a[0], a[0]); }");
+    }, "已知别名");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "arr<int> a = {cell1, 0}; void f(int& x, int& y) {} "
+            "void main_loop() { int i = 0; int j = 1; f(a[i], a[j]); }");
+    }, "需要 restrict");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void f(int& value) {} void main_loop() { f(1 + 2); }");
+    }, "可赋值左值");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void f(int& value) {} void main_loop() { number x = 1; f(x); }");
+    }, "精确匹配");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void f(restrict int value) {} void main_loop() {}");
+    }, "只能修饰引用参数");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { arr<unit> workers = {}; }");
+    }, "数组元素类型不能存储");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { unit worker = unit_bind(@copper); }");
+    }, "unit_kind 或 unit");
+
+    requireCompileError([] {
+        (void)mdtc::compile("void main_loop() { int build_up = 1; }");
+    }, "内置常量名称不能被声明");
+
+    requireCompileError([] {
+        (void)mdtc::compile(
+            "void main_loop() { unit worker = unit_bind(@poly); worker.get_block(point{}, @stone, router1, @air); }");
+    }, "可赋值");
 }
 
 } // namespace
@@ -1228,16 +2403,30 @@ void testDiagnostics() {
 int main() {
     try {
         testFunctionsControlFlowAndPrint();
+        testSwitchCaseAndJumpTables();
         testAutomaticInlining();
         testGlobalPersistsAcrossMainLoop();
+        testMainInitRunsOnceBeforeMainLoop();
         testGlobalInitializerFunctionReachability();
         testWhileAndShortCircuit();
+        testSafeComparisonJumpFusion();
         testLoopCarriedValueAcrossEmptyBlocks();
         testValueAfterFunctionCallRemainsLive();
         testCalleeStateUpdatesRemainLive();
         testBasicTypes();
+        testUtf8SourceIdentifiersStringsAndComments();
+        testPreprocessorDefinesAndIncludes();
         testGetLink();
+        testContentConstantsAndLookup();
         testBuiltinBuildingMemberMethods();
+        testUnitBindAndControlMemberMethods();
+        testConfigMemberMethods();
+        testSensorMemberMethods();
+        testNullLiteralAndComparison();
+        testStopAndExit();
+        testRadarMemberMethods();
+        testConditionalSelect();
+        testUserMemberFunctions();
         testImplicitLinksAndPrintFlushIndex();
         testPrintCharFormatAndPrintf();
         testDrawFlush();
@@ -1251,6 +2440,7 @@ int main() {
         testVectorDotAndCross();
         testOpBuiltinFunctions();
         testMemoryArrays();
+        testReferenceParameters();
         testDiagnostics();
     } catch (const std::exception& error) {
         std::cerr << "测试失败: " << error.what() << '\n';

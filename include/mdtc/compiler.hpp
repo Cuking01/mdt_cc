@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace mdtc {
 
@@ -20,6 +21,8 @@ private:
 
 struct CompileOptions {
     bool debug = false;
+    std::string sourcePath;
+    std::vector<std::string> includePaths;
 };
 
 [[nodiscard]] std::string compile(std::string_view source, const CompileOptions& options = {});

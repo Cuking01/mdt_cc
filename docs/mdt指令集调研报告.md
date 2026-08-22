@@ -99,6 +99,11 @@
 
 当前语言将四则、整数余数、比较和逻辑与映射为常规运算符。游戏支持小数的普通余数另有 `mod`。其余 `LogicOp` 使用无 `op_` 前缀的内置函数：`idiv`、`mod`、`emod`、`pow`、`strict_equal`、`shl`、`shr`、`ushr`、`bit_or`、`bit_and`、`bit_xor`、`bit_not`、`max`、`min`、`angle`、`angle_diff`、`len`、`noise`、`abs`、`sign`、`log`、`logn`、`log10`、`floor`、`ceil`、`round`、`sqrt`、`rand` 以及全部三角函数。`angle`/`len` 额外接受 `vec`，`noise` 额外接受 `point` 或 `vec`。
 
+当前语言实现 `condition ? a : b` 的两级 lowering。纯结果表达式直接使用 `select`，
+比较条件复用其 `ConditionOp`，结构体按字段展开。若任一结果分支包含赋值、递增、普通
+函数调用、`rand` 或其他副作用，则改用条件跳转，只执行被选中的一支，并在汇合点写入
+统一结果槽。两支同为 `void` 时也使用分支路径；一支为 `void`、另一支有值则报错。
+
 ### 4.2 链接、内存和通用感知
 
 | 指令 | 输入 | 输出 | 失败/权限语义 |
@@ -318,7 +323,7 @@ name: spawn
 variant: unit
 privilege: world
 operands:
-  - {name: type, direction: in, type: unit_type}
+  - {name: type, direction: in, type: unit_kind}
   - {name: x, direction: in, type: number, unit: logic_coordinate}
   - {name: y, direction: in, type: number, unit: logic_coordinate}
   - {name: rotation, direction: in, type: number, unit: degree}
@@ -358,7 +363,7 @@ failure: preserve_output
   lower: sensor
   first_operand: unit
   property: type
-  result: unit_type
+  result: unit_kind
 
 - builtin: valid
   lower_sequence:
